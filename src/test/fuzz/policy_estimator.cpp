@@ -2,7 +2,6 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <optional.h>
 #include <policy/fees.h>
 #include <primitives/transaction.h>
 #include <test/fuzz/FuzzedDataProvider.h>
@@ -11,8 +10,14 @@
 #include <txmempool.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
+
+void initialize()
+{
+    InitializeFuzzingContext();
+}
 
 void test_one_input(const std::vector<uint8_t>& buffer)
 {
@@ -21,7 +26,7 @@ void test_one_input(const std::vector<uint8_t>& buffer)
     while (fuzzed_data_provider.ConsumeBool()) {
         switch (fuzzed_data_provider.ConsumeIntegralInRange<int>(0, 3)) {
         case 0: {
-            const Optional<CMutableTransaction> mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);
+            const std::optional<CMutableTransaction> mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);
             if (!mtx) {
                 break;
             }
@@ -35,7 +40,7 @@ void test_one_input(const std::vector<uint8_t>& buffer)
         case 1: {
             std::vector<CTxMemPoolEntry> mempool_entries;
             while (fuzzed_data_provider.ConsumeBool()) {
-                const Optional<CMutableTransaction> mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);
+                const std::optional<CMutableTransaction> mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);
                 if (!mtx) {
                     break;
                 }
@@ -65,5 +70,11 @@ void test_one_input(const std::vector<uint8_t>& buffer)
         FeeCalculation fee_calculation;
         (void)block_policy_estimator.estimateSmartFee(fuzzed_data_provider.ConsumeIntegral<int>(), fuzzed_data_provider.ConsumeBool() ? &fee_calculation : nullptr, fuzzed_data_provider.ConsumeBool());
         (void)block_policy_estimator.HighestTargetTracked(fuzzed_data_provider.PickValueInArray({FeeEstimateHorizon::SHORT_HALFLIFE, FeeEstimateHorizon::MED_HALFLIFE, FeeEstimateHorizon::LONG_HALFLIFE}));
+    }
+    {
+        FuzzedAutoFileProvider fuzzed_auto_file_provider = ConsumeAutoFile(fuzzed_data_provider);
+        CAutoFile fuzzed_auto_file = fuzzed_auto_file_provider.open();
+        block_policy_estimator.Write(fuzzed_auto_file);
+        block_policy_estimator.Read(fuzzed_auto_file);
     }
 }

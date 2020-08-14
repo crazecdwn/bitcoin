@@ -15,7 +15,7 @@ from collections import defaultdict
 
 # Avoid wildcard * imports
 from test_framework.blocktools import (create_block, create_coinbase)
-from test_framework.messages import CInv
+from test_framework.messages import CInv, MSG_BLOCK
 from test_framework.mininode import (
     P2PInterface,
     mininode_lock,
@@ -166,7 +166,7 @@ class ExampleTest(BitcoinTestFramework):
 
         height = self.nodes[0].getblockcount()
 
-        for i in range(10):
+        for _ in range(10):
             # Use the mininode and blocktools functionality to manually build a block
             # Calling the generate() rpc is easier, but this allows us to exactly
             # control the blocks and transactions.
@@ -198,7 +198,7 @@ class ExampleTest(BitcoinTestFramework):
 
         getdata_request = msg_getdata()
         for block in blocks:
-            getdata_request.inv.append(CInv(2, block))
+            getdata_request.inv.append(CInv(MSG_BLOCK, block))
         self.nodes[2].p2p.send_message(getdata_request)
 
         # wait_until() will loop until a predicate condition is met. Use it to test properties of the

@@ -14,15 +14,13 @@
 #include <wincrypt.h>
 #endif
 #include <logging.h>  // for LogPrintf()
+#include <randomenv.h>
+#include <support/allocators/secure.h>
 #include <sync.h>     // for Mutex
 #include <util/time.h> // for GetTimeMicros()
 
 #include <stdlib.h>
 #include <thread>
-
-#include <randomenv.h>
-
-#include <support/allocators/secure.h>
 
 #ifndef WIN32
 #include <fcntl.h>
@@ -317,12 +315,16 @@ void GetOSRand(unsigned char *ent32)
     if (getentropy(ent32, NUM_OS_RANDOM_BYTES) != 0) {
         RandFailure();
     }
+    // Silence a compiler warning about unused function.
+    (void)GetDevURandom;
 #elif defined(HAVE_GETENTROPY_RAND) && defined(MAC_OSX)
     /* getentropy() is available on macOS 10.12 and later.
      */
     if (getentropy(ent32, NUM_OS_RANDOM_BYTES) != 0) {
         RandFailure();
     }
+    // Silence a compiler warning about unused function.
+    (void)GetDevURandom;
 #elif defined(HAVE_SYSCTL_ARND)
     /* FreeBSD, NetBSD and similar. It is possible for the call to return less
      * bytes than requested, so need to read in a loop.
@@ -336,6 +338,8 @@ void GetOSRand(unsigned char *ent32)
         }
         have += len;
     } while (have < NUM_OS_RANDOM_BYTES);
+    // Silence a compiler warning about unused function.
+    (void)GetDevURandom;
 #else
     /* Fall back to /dev/urandom if there is no specific method implemented to
      * get system entropy for this OS.
@@ -588,16 +592,6 @@ bool g_mock_deterministic_tests{false};
 uint64_t GetRand(uint64_t nMax) noexcept
 {
     return FastRandomContext(g_mock_deterministic_tests).randrange(nMax);
-}
-
-std::chrono::microseconds GetRandMicros(std::chrono::microseconds duration_max) noexcept
-{
-    return std::chrono::microseconds{GetRand(duration_max.count())};
-}
-
-std::chrono::milliseconds GetRandMillis(std::chrono::milliseconds duration_max) noexcept
-{
-    return std::chrono::milliseconds{GetRand(duration_max.count())};
 }
 
 int GetRandInt(int nMax) noexcept

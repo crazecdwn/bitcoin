@@ -11,6 +11,7 @@
 #include <util/system.h>
 #include <util/translation.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 bool VerifyWallets(interfaces::Chain& chain, const std::vector<std::string>& wallet_files)
 {
@@ -37,11 +38,6 @@ bool VerifyWallets(interfaces::Chain& chain, const std::vector<std::string>& wal
 
     chain.initMessage(_("Verifying wallet(s)...").translated);
 
-    // Parameter interaction code should have thrown an error if -salvagewallet
-    // was enabled with more than wallet file, so the wallet_files size check
-    // here should have no effect.
-    bool salvage_wallet = gArgs.GetBoolArg("-salvagewallet", false) && wallet_files.size() <= 1;
-
     // Keep track of each wallet absolute path to detect duplicates.
     std::set<fs::path> wallet_paths;
 
@@ -55,8 +51,8 @@ bool VerifyWallets(interfaces::Chain& chain, const std::vector<std::string>& wal
 
         bilingual_str error_string;
         std::vector<bilingual_str> warnings;
-        bool verify_success = CWallet::Verify(chain, location, salvage_wallet, error_string, warnings);
-        if (!warnings.empty()) chain.initWarning(Join(warnings, "\n", OpTranslated));
+        bool verify_success = CWallet::Verify(chain, location, error_string, warnings);
+        if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
         if (!verify_success) {
             chain.initError(error_string);
             return false;
@@ -73,7 +69,7 @@ bool LoadWallets(interfaces::Chain& chain, const std::vector<std::string>& walle
             bilingual_str error;
             std::vector<bilingual_str> warnings;
             std::shared_ptr<CWallet> pwallet = CWallet::CreateWalletFromFile(chain, WalletLocation(walletFile), error, warnings);
-            if (!warnings.empty()) chain.initWarning(Join(warnings, "\n", OpTranslated));
+            if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
             if (!pwallet) {
                 chain.initError(error);
                 return false;
@@ -87,28 +83,30 @@ bool LoadWallets(interfaces::Chain& chain, const std::vector<std::string>& walle
     }
 }
 
-void StartWallets(CScheduler& scheduler)
+void StartWallets(CScheduler& scheduler, const ArgsManager& args)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets()) {
         pwallet->postInitProcess();
     }
 
     // Schedule periodic wallet flushes and tx rebroadcasts
-    scheduler.scheduleEvery(MaybeCompactWalletDB, std::chrono::milliseconds{500});
+    if (args.GetBoolArg("-flushwallet", DEFAULT_FLUSHWALLET)) {
+        scheduler.scheduleEvery(MaybeCompactWalletDB, std::chrono::milliseconds{500});
+    }
     scheduler.scheduleEvery(MaybeResendWalletTxs, std::chrono::milliseconds{1000});
 }
 
 void FlushWallets()
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets()) {
-        pwallet->Flush(false);
+        pwallet->Flush();
     }
 }
 
 void StopWallets()
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets()) {
-        pwallet->Flush(true);
+        pwallet->Close();
     }
 }
 

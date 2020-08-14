@@ -15,11 +15,22 @@ fi
 
 DOCKER_EXEC mkdir -p ${DEPENDS_DIR}/SDKs ${DEPENDS_DIR}/sdk-sources
 
-if [ -n "$OSX_SDK" ] && [ ! -f ${DEPENDS_DIR}/sdk-sources/MacOSX${OSX_SDK}.sdk.tar.gz ]; then
-  curl --location --fail $SDK_URL/MacOSX${OSX_SDK}.sdk.tar.gz -o ${DEPENDS_DIR}/sdk-sources/MacOSX${OSX_SDK}.sdk.tar.gz
+OSX_SDK_BASENAME="Xcode-${XCODE_VERSION}-${XCODE_BUILD_ID}-extracted-SDK-with-libcxx-headers.tar.gz"
+OSX_SDK_PATH="${DEPENDS_DIR}/sdk-sources/${OSX_SDK_BASENAME}"
+
+if [ -n "$XCODE_VERSION" ] && [ ! -f "$OSX_SDK_PATH" ]; then
+  curl --location --fail "${SDK_URL}/${OSX_SDK_BASENAME}" -o "$OSX_SDK_PATH"
 fi
-if [ -n "$OSX_SDK" ] && [ -f ${DEPENDS_DIR}/sdk-sources/MacOSX${OSX_SDK}.sdk.tar.gz ]; then
-  DOCKER_EXEC tar -C ${DEPENDS_DIR}/SDKs -xf ${DEPENDS_DIR}/sdk-sources/MacOSX${OSX_SDK}.sdk.tar.gz
+
+if [[ ${USE_MEMORY_SANITIZER} == "true" ]]; then
+  # Use BDB compiled using install_db4.sh script to work around linking issue when using BDB
+  # from depends. See https://github.com/bitcoin/bitcoin/pull/18288#discussion_r433189350 for
+  # details.
+  DOCKER_EXEC "contrib/install_db4.sh \$(pwd) --enable-umrw CC=clang CXX=clang++ CFLAGS='${MSAN_FLAGS}' CXXFLAGS='${MSAN_AND_LIBCXX_FLAGS}'"
+fi
+
+if [ -n "$XCODE_VERSION" ] && [ -f "$OSX_SDK_PATH" ]; then
+  DOCKER_EXEC tar -C "${DEPENDS_DIR}/SDKs" -xf "$OSX_SDK_PATH"
 fi
 if [[ $HOST = *-mingw32 ]]; then
   DOCKER_EXEC update-alternatives --set $HOST-g++ \$\(which $HOST-g++-posix\)
@@ -37,6 +48,6 @@ if [ -z "$NO_DEPENDS" ]; then
 fi
 if [ -n "$PREVIOUS_RELEASES_TO_DOWNLOAD" ]; then
   BEGIN_FOLD previous-versions
-  DOCKER_EXEC contrib/devtools/previous_release.sh -b -t "$PREVIOUS_RELEASES_DIR" "${PREVIOUS_RELEASES_TO_DOWNLOAD}"
+  DOCKER_EXEC contrib/devtools/previous_release.py -b -t "$PREVIOUS_RELEASES_DIR" "${PREVIOUS_RELEASES_TO_DOWNLOAD}"
   END_FOLD
 fi

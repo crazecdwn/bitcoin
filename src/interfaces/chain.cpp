@@ -13,6 +13,7 @@
 #include <node/coin.h>
 #include <node/context.h>
 #include <node/transaction.h>
+#include <node/ui_interface.h>
 #include <policy/fees.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
@@ -25,7 +26,6 @@
 #include <sync.h>
 #include <timedata.h>
 #include <txmempool.h>
-#include <ui_interface.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <util/system.h>
@@ -63,9 +63,9 @@ public:
     {
         m_notifications->transactionAddedToMempool(tx);
     }
-    void TransactionRemovedFromMempool(const CTransactionRef& tx) override
+    void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) override
     {
-        m_notifications->transactionRemovedFromMempool(tx);
+        m_notifications->transactionRemovedFromMempool(tx, reason);
     }
     void BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* index) override
     {
@@ -127,7 +127,7 @@ public:
         ::tableRPC.appendCommand(m_command.name, &m_command);
     }
 
-    void disconnect() override final
+    void disconnect() final
     {
         if (m_wrapped_command) {
             m_wrapped_command = nullptr;
@@ -344,7 +344,7 @@ public:
     bool shutdownRequested() override { return ShutdownRequested(); }
     int64_t getAdjustedTime() override { return GetAdjustedTime(); }
     void initMessage(const std::string& message) override { ::uiInterface.InitMessage(message); }
-    void initWarning(const std::string& message) override { InitWarning(message); }
+    void initWarning(const bilingual_str& message) override { InitWarning(message); }
     void initError(const bilingual_str& message) override { InitError(message); }
     void showProgress(const std::string& title, int progress, bool resume_possible) override
     {

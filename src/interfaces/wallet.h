@@ -9,8 +9,8 @@
 #include <pubkey.h>                    // For CKeyID and CScriptID (definitions needed in CTxDestination instantiation)
 #include <script/standard.h>           // For CTxDestination
 #include <support/allocators/secure.h> // For SecureString
-#include <ui_interface.h>              // For ChangeType
 #include <util/message.h>
+#include <util/ui_change_type.h>
 
 #include <functional>
 #include <map>
@@ -197,16 +197,14 @@ public:
         bool sign,
         bool bip32derivs,
         PartiallySignedTransaction& psbtx,
-        bool& complete) = 0;
+        bool& complete,
+        size_t* n_signed) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
 
-    //! Get balances if possible without waiting for chain and wallet locks.
-    virtual bool tryGetBalances(WalletBalances& balances,
-        int& num_blocks,
-        bool force,
-        int cached_num_blocks) = 0;
+    //! Get balances if possible without blocking.
+    virtual bool tryGetBalances(WalletBalances& balances, uint256& block_hash) = 0;
 
     //! Get balance.
     virtual CAmount getBalance() = 0;
@@ -257,9 +255,6 @@ public:
 
     // Get default address type.
     virtual OutputType getDefaultAddressType() = 0;
-
-    // Get default change type.
-    virtual OutputType getDefaultChangeType() = 0;
 
     //! Get max tx fee.
     virtual CAmount getDefaultMaxTxFee() = 0;

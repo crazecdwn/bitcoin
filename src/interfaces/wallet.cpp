@@ -9,13 +9,16 @@
 #include <interfaces/handler.h>
 #include <policy/fees.h>
 #include <primitives/transaction.h>
+#include <rpc/server.h>
 #include <script/standard.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
-#include <ui_interface.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/ref.h>
 #include <util/system.h>
+#include <util/ui_change_type.h>
+#include <wallet/context.h>
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
 #include <wallet/ismine.h>
@@ -332,9 +335,10 @@ public:
         bool sign,
         bool bip32derivs,
         PartiallySignedTransaction& psbtx,
-        bool& complete) override
+        bool& complete,
+        size_t* n_signed) override
     {
-        return m_wallet->FillPSBT(psbtx, complete, sighash_type, sign, bip32derivs);
+        return m_wallet->FillPSBT(psbtx, complete, sighash_type, sign, bip32derivs, n_signed);
     }
     WalletBalances getBalances() override
     {
@@ -351,14 +355,13 @@ public:
         }
         return result;
     }
-    bool tryGetBalances(WalletBalances& balances, int& num_blocks, bool force, int cached_num_blocks) override
+    bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
     {
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
         if (!locked_wallet) {
             return false;
         }
-        num_blocks = m_wallet->GetLastBlockHeight();
-        if (!force && num_blocks == cached_num_blocks) return false;
+        block_hash = m_wallet->GetLastBlockHash();
         balances = getBalances();
         return true;
     }
@@ -435,7 +438,6 @@ public:
     bool canGetAddresses() override { return m_wallet->CanGetAddresses(); }
     bool privateKeysDisabled() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS); }
     OutputType getDefaultAddressType() override { return m_wallet->m_default_address_type; }
-    OutputType getDefaultChangeType() override { return m_wallet->m_default_change_type; }
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }
     void remove() override
     {
@@ -481,18 +483,24 @@ public:
 class WalletClientImpl : public ChainClient
 {
 public:
-    WalletClientImpl(Chain& chain, std::vector<std::string> wallet_filenames)
-        : m_chain(chain), m_wallet_filenames(std::move(wallet_filenames))
+    WalletClientImpl(Chain& chain, ArgsManager& args, std::vector<std::string> wallet_filenames)
+        : m_wallet_filenames(std::move(wallet_filenames))
     {
+        m_context.chain = &chain;
+        m_context.args = &args;
     }
     void registerRpcs() override
     {
-        g_rpc_chain = &m_chain;
-        return RegisterWalletRPCCommands(m_chain, m_rpc_handlers);
+        for (const CRPCCommand& command : GetWalletRPCCommands()) {
+            m_rpc_commands.emplace_back(command.category, command.name, [this, &command](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
+                return command.actor({request, m_context}, result, last_handler);
+            }, command.argNames, command.unique_id);
+            m_rpc_handlers.emplace_back(m_context.chain->handleRpc(m_rpc_commands.back()));
+        }
     }
-    bool verify() override { return VerifyWallets(m_chain, m_wallet_filenames); }
-    bool load() override { return LoadWallets(m_chain, m_wallet_filenames); }
-    void start(CScheduler& scheduler) override { return StartWallets(scheduler); }
+    bool verify() override { return VerifyWallets(*m_context.chain, m_wallet_filenames); }
+    bool load() override { return LoadWallets(*m_context.chain, m_wallet_filenames); }
+    void start(CScheduler& scheduler) override { return StartWallets(scheduler, *Assert(m_context.args)); }
     void flush() override { return FlushWallets(); }
     void stop() override { return StopWallets(); }
     void setMockTime(int64_t time) override { return SetMockTime(time); }
@@ -506,18 +514,19 @@ public:
     }
     ~WalletClientImpl() override { UnloadWallets(); }
 
-    Chain& m_chain;
-    std::vector<std::string> m_wallet_filenames;
+    WalletContext m_context;
+    const std::vector<std::string> m_wallet_filenames;
     std::vector<std::unique_ptr<Handler>> m_rpc_handlers;
+    std::list<CRPCCommand> m_rpc_commands;
 };
 
 } // namespace
 
 std::unique_ptr<Wallet> MakeWallet(const std::shared_ptr<CWallet>& wallet) { return wallet ? MakeUnique<WalletImpl>(wallet) : nullptr; }
 
-std::unique_ptr<ChainClient> MakeWalletClient(Chain& chain, std::vector<std::string> wallet_filenames)
+std::unique_ptr<ChainClient> MakeWalletClient(Chain& chain, ArgsManager& args, std::vector<std::string> wallet_filenames)
 {
-    return MakeUnique<WalletClientImpl>(chain, std::move(wallet_filenames));
+    return MakeUnique<WalletClientImpl>(chain, args, std::move(wallet_filenames));
 }
 
 } // namespace interfaces

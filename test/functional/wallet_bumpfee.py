@@ -62,7 +62,7 @@ class BumpFeeTest(BitcoinTestFramework):
         self.log.info("Mining blocks...")
         peer_node.generate(110)
         self.sync_all()
-        for i in range(25):
+        for _ in range(25):
             peer_node.sendtoaddress(rbf_node_address, 0.001)
         self.sync_all()
         peer_node.generate(1)
@@ -71,6 +71,7 @@ class BumpFeeTest(BitcoinTestFramework):
 
         self.log.info("Running tests")
         dest_address = peer_node.getnewaddress()
+        test_invalid_parameters(rbf_node, dest_address)
         test_simple_bumpfee_succeeds(self, "default", rbf_node, peer_node, dest_address)
         test_simple_bumpfee_succeeds(self, "fee_rate", rbf_node, peer_node, dest_address)
         test_feerate_args(self, rbf_node, peer_node, dest_address)
@@ -92,6 +93,28 @@ class BumpFeeTest(BitcoinTestFramework):
         test_small_output_with_feerate_succeeds(self, rbf_node, dest_address)
         test_no_more_inputs_fails(self, rbf_node, dest_address)
 
+def test_invalid_parameters(node, dest_address):
+    txid = spend_one_input(node, dest_address)
+    # invalid estimate mode
+    assert_raises_rpc_error(-8, "Invalid estimate_mode parameter", node.bumpfee, txid, {
+        "estimate_mode": "moo",
+    })
+    assert_raises_rpc_error(-3, "Expected type string", node.bumpfee, txid, {
+        "estimate_mode": 38,
+    })
+    assert_raises_rpc_error(-3, "Expected type string", node.bumpfee, txid, {
+        "estimate_mode": {
+            "foo": "bar",
+        },
+    })
+    assert_raises_rpc_error(-8, "Invalid estimate_mode parameter", node.bumpfee, txid, {
+        "estimate_mode": Decimal("3.141592"),
+    })
+    # confTarget and conf_target
+    assert_raises_rpc_error(-8, "confTarget and conf_target options should not both be set", node.bumpfee, txid, {
+        "confTarget": 123,
+        "conf_target": 456,
+    })
 
 def test_simple_bumpfee_succeeds(self, mode, rbf_node, peer_node, dest_address):
     self.log.info('Test simple bumpfee: {}'.format(mode))
@@ -100,13 +123,19 @@ def test_simple_bumpfee_succeeds(self, mode, rbf_node, peer_node, dest_address):
     self.sync_mempools((rbf_node, peer_node))
     assert rbfid in rbf_node.getrawmempool() and rbfid in peer_node.getrawmempool()
     if mode == "fee_rate":
+        bumped_psbt = rbf_node.psbtbumpfee(rbfid, {"fee_rate": NORMAL})
         bumped_tx = rbf_node.bumpfee(rbfid, {"fee_rate": NORMAL})
     else:
+        bumped_psbt = rbf_node.psbtbumpfee(rbfid)
         bumped_tx = rbf_node.bumpfee(rbfid)
     assert_equal(bumped_tx["errors"], [])
     assert bumped_tx["fee"] > -rbftx["fee"]
     assert_equal(bumped_tx["origfee"], -rbftx["fee"])
     assert "psbt" not in bumped_tx
+    assert_equal(bumped_psbt["errors"], [])
+    assert bumped_psbt["fee"] > -rbftx["fee"]
+    assert_equal(bumped_psbt["origfee"], -rbftx["fee"])
+    assert "psbt" in bumped_psbt
     # check that bumped_tx propagates, original tx was evicted and has a wallet conflict
     self.sync_mempools((rbf_node, peer_node))
     assert bumped_tx["txid"] in rbf_node.getrawmempool()
@@ -127,9 +156,10 @@ def test_feerate_args(self, rbf_node, peer_node, dest_address):
     self.sync_mempools((rbf_node, peer_node))
     assert rbfid in rbf_node.getrawmempool() and rbfid in peer_node.getrawmempool()
 
-    assert_raises_rpc_error(-8, "confTarget can't be set with fee_rate. Please provide either a confirmation target in blocks for automatic fee estimation, or an explicit fee rate.", rbf_node.bumpfee, rbfid, {"fee_rate": NORMAL, "confTarget": 1})
+    assert_raises_rpc_error(-8, "conf_target can't be set with fee_rate. Please provide either a confirmation target in blocks for automatic fee estimation, or an explicit fee rate.", rbf_node.bumpfee, rbfid, {"fee_rate": NORMAL, "confTarget": 1})
 
     assert_raises_rpc_error(-3, "Unexpected key totalFee", rbf_node.bumpfee, rbfid, {"totalFee": NORMAL})
+    assert_raises_rpc_error(-8, "conf_target can't be set with fee_rate. Please provide either a confirmation target in blocks for automatic fee estimation, or an explicit fee rate.", rbf_node.bumpfee, rbfid, {"fee_rate":0.00001, "confTarget": 1})
 
     # Bumping to just above minrelay should fail to increase total fee enough, at least
     assert_raises_rpc_error(-8, "Insufficient total fee", rbf_node.bumpfee, rbfid, {"fee_rate": INSUFFICIENT})
@@ -367,7 +397,7 @@ def test_watchonly_psbt(self, peer_node, rbf_node, dest_address):
     assert_equal(len(watcher.decodepsbt(psbt)["tx"]["vin"]), 1)
 
     # Bump fee, obnoxiously high to add additional watchonly input
-    bumped_psbt = watcher.bumpfee(original_txid, {"fee_rate": HIGH})
+    bumped_psbt = watcher.psbtbumpfee(original_txid, {"fee_rate": HIGH})
     assert_greater_than(len(watcher.decodepsbt(bumped_psbt['psbt'])["tx"]["vin"]), 1)
     assert "txid" not in bumped_psbt
     assert_equal(bumped_psbt["origfee"], -watcher.gettransaction(original_txid)["fee"])

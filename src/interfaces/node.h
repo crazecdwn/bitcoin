@@ -10,6 +10,7 @@
 #include <net_types.h>  // For banmap_t
 #include <netaddress.h> // For Network
 #include <support/allocators/secure.h> // For SecureString
+#include <util/translation.h>
 
 #include <functional>
 #include <memory>
@@ -27,6 +28,7 @@ class Coin;
 class RPCTimerInterface;
 class UniValue;
 class proxyType;
+enum class SynchronizationState;
 enum class WalletCreationStatus;
 struct CNodeStateStats;
 struct NodeContext;
@@ -35,6 +37,17 @@ struct bilingual_str;
 namespace interfaces {
 class Handler;
 class Wallet;
+struct BlockTip;
+
+//! Block and header tip information
+struct BlockAndHeaderTipInfo
+{
+    int block_height;
+    int64_t block_time;
+    int header_height;
+    int64_t header_time;
+    double verification_progress;
+};
 
 //! Top-level interface for a bitcoin node (bitcoind process).
 class Node
@@ -43,7 +56,7 @@ public:
     virtual ~Node() {}
 
     //! Send init error.
-    virtual void initError(const std::string& message) = 0;
+    virtual void initError(const bilingual_str& message) = 0;
 
     //! Set command line arguments.
     virtual bool parseParameters(int argc, const char* const argv[], std::string& error) = 0;
@@ -63,6 +76,11 @@ public:
     //! Choose network parameters.
     virtual void selectParams(const std::string& network) = 0;
 
+    //! Read and update <datadir>/settings.json file with saved settings. This
+    //! needs to be called after selectParams() because the settings file
+    //! location is network-specific.
+    virtual bool initSettings(std::string& error) = 0;
+
     //! Get the (assumed) blockchain size.
     virtual uint64_t getAssumedBlockchainSize() = 0;
 
@@ -79,7 +97,7 @@ public:
     virtual void initParameterInteraction() = 0;
 
     //! Get warnings.
-    virtual std::string getWarnings() = 0;
+    virtual bilingual_str getWarnings() = 0;
 
     // Get log flags.
     virtual uint32_t getLogCategories() = 0;
@@ -88,7 +106,7 @@ public:
     virtual bool baseInitialize() = 0;
 
     //! Start node.
-    virtual bool appInitMain() = 0;
+    virtual bool appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info = nullptr) = 0;
 
     //! Stop node.
     virtual void appShutdown() = 0;
@@ -119,7 +137,7 @@ public:
     virtual bool getBanned(banmap_t& banmap) = 0;
 
     //! Ban node.
-    virtual bool ban(const CNetAddr& net_addr, BanReason reason, int64_t ban_time_offset) = 0;
+    virtual bool ban(const CNetAddr& net_addr, int64_t ban_time_offset) = 0;
 
     //! Unban node.
     virtual bool unban(const CSubNet& ip) = 0;
@@ -147,6 +165,9 @@ public:
 
     //! Get num blocks.
     virtual int getNumBlocks() = 0;
+
+    //! Get best block hash.
+    virtual uint256 getBestBlockHash() = 0;
 
     //! Get last block time.
     virtual int64_t getLastBlockTime() = 0;
@@ -249,20 +270,29 @@ public:
 
     //! Register handler for block tip messages.
     using NotifyBlockTipFn =
-        std::function<void(bool initial_download, int height, int64_t block_time, double verification_progress)>;
+        std::function<void(SynchronizationState, interfaces::BlockTip tip, double verification_progress)>;
     virtual std::unique_ptr<Handler> handleNotifyBlockTip(NotifyBlockTipFn fn) = 0;
 
     //! Register handler for header tip messages.
     using NotifyHeaderTipFn =
-        std::function<void(bool initial_download, int height, int64_t block_time, double verification_progress)>;
+        std::function<void(SynchronizationState, interfaces::BlockTip tip, double verification_progress)>;
     virtual std::unique_ptr<Handler> handleNotifyHeaderTip(NotifyHeaderTipFn fn) = 0;
 
-    //! Return pointer to internal chain interface, useful for testing.
+    //! Get and set internal node context. Useful for testing, but not
+    //! accessible across processes.
     virtual NodeContext* context() { return nullptr; }
+    virtual void setContext(NodeContext* context) { }
 };
 
 //! Return implementation of Node interface.
-std::unique_ptr<Node> MakeNode();
+std::unique_ptr<Node> MakeNode(NodeContext* context = nullptr);
+
+//! Block tip (could be a header or not, depends on the subscribed signal).
+struct BlockTip {
+    int block_height;
+    int64_t block_time;
+    uint256 block_hash;
+};
 
 } // namespace interfaces
 
