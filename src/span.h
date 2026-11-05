@@ -1,93 +1,113 @@
-// Copyright (c) 2018-2020 The Bitcoin Core developers
+// Copyright (c) 2018-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_SPAN_H
 #define BITCOIN_SPAN_H
 
-#include <type_traits>
+#include <cassert>
 #include <cstddef>
-#include <algorithm>
-#include <assert.h>
+#include <span>
+#include <type_traits>
+#include <utility>
 
-/** A Span is an object that can refer to a contiguous sequence of objects.
+/** A span is an object that can refer to a contiguous sequence of objects.
  *
- * It implements a subset of C++20's std::span.
+ * Things to be aware of when writing code that deals with spans:
+ *
+ * - Similar to references themselves, spans are subject to reference lifetime
+ *   issues. The user is responsible for making sure the objects pointed to by
+ *   a span live as long as the span is used. For example:
+ *
+ *       std::vector<int> vec{1,2,3,4};
+ *       std::span<int> sp(vec);
+ *       vec.push_back(5);
+ *       printf("%i\n", sp.front()); // UB!
+ *
+ *   may exhibit undefined behavior, as increasing the size of a vector may
+ *   invalidate references.
+ *
+ * - One particular pitfall is that spans can be constructed from temporaries,
+ *   but this is unsafe when the span is stored in a variable, outliving the
+ *   temporary. For example, this will compile, but exhibits undefined behavior:
+ *
+ *       std::span<const int> sp(std::vector<int>{1, 2, 3});
+ *       printf("%i\n", sp.front()); // UB!
+ *
+ *   The lifetime of the vector ends when the statement it is created in ends.
+ *   Thus the span is left with a dangling reference, and using it is undefined.
+ *
+ * - Due to spans automatic creation from range-like objects (arrays, and data
+ *   types that expose a data() and size() member function), functions that
+ *   accept a span as input parameter can be called with any compatible
+ *   range-like object. For example, this works:
+ *
+ *       void Foo(std::span<const int> arg);
+ *
+ *       Foo(std::vector<int>{1, 2, 3}); // Works
+ *
+ *   This is very useful in cases where a function truly does not care about the
+ *   container, and only about having exactly a range of elements. However it
+ *   may also be surprising to see automatic conversions in this case.
+ *
+ *   When a function accepts a span with a mutable element type, it will not
+ *   accept temporaries; only variables or other references. For example:
+ *
+ *       void FooMut(std::span<int> arg);
+ *
+ *       FooMut(std::vector<int>{1, 2, 3}); // Does not compile
+ *       std::vector<int> baz{1, 2, 3};
+ *       FooMut(baz); // Works
+ *
+ *   This is similar to how functions that take (non-const) lvalue references
+ *   as input cannot accept temporaries. This does not work either:
+ *
+ *       void FooVec(std::vector<int>& arg);
+ *       FooVec(std::vector<int>{1, 2, 3}); // Does not compile
+ *
+ *   The idea is that if a function accepts a mutable reference, a meaningful
+ *   result will be present in that variable after the call. Passing a temporary
+ *   is useless in that context.
  */
-template<typename C>
-class Span
-{
-    C* m_data;
-    std::ptrdiff_t m_size;
-
-public:
-    constexpr Span() noexcept : m_data(nullptr), m_size(0) {}
-    constexpr Span(C* data, std::ptrdiff_t size) noexcept : m_data(data), m_size(size) {}
-    constexpr Span(C* data, C* end) noexcept : m_data(data), m_size(end - data) {}
-
-    /** Implicit conversion of spans between compatible types.
-     *
-     *  Specifically, if a pointer to an array of type O can be implicitly converted to a pointer to an array of type
-     *  C, then permit implicit conversion of Span<O> to Span<C>. This matches the behavior of the corresponding
-     *  C++20 std::span constructor.
-     *
-     *  For example this means that a Span<T> can be converted into a Span<const T>.
-     */
-    template <typename O, typename std::enable_if<std::is_convertible<O (*)[], C (*)[]>::value, int>::type = 0>
-    constexpr Span(const Span<O>& other) noexcept : m_data(other.m_data), m_size(other.m_size) {}
-
-    /** Default copy constructor. */
-    constexpr Span(const Span&) noexcept = default;
-
-    /** Default assignment operator. */
-    Span& operator=(const Span& other) noexcept = default;
-
-    constexpr C* data() const noexcept { return m_data; }
-    constexpr C* begin() const noexcept { return m_data; }
-    constexpr C* end() const noexcept { return m_data + m_size; }
-    constexpr C& front() const noexcept { return m_data[0]; }
-    constexpr C& back() const noexcept { return m_data[m_size - 1]; }
-    constexpr std::ptrdiff_t size() const noexcept { return m_size; }
-    constexpr C& operator[](std::ptrdiff_t pos) const noexcept { return m_data[pos]; }
-
-    constexpr Span<C> subspan(std::ptrdiff_t offset) const noexcept { return Span<C>(m_data + offset, m_size - offset); }
-    constexpr Span<C> subspan(std::ptrdiff_t offset, std::ptrdiff_t count) const noexcept { return Span<C>(m_data + offset, count); }
-    constexpr Span<C> first(std::ptrdiff_t count) const noexcept { return Span<C>(m_data, count); }
-    constexpr Span<C> last(std::ptrdiff_t count) const noexcept { return Span<C>(m_data + m_size - count, count); }
-
-    friend constexpr bool operator==(const Span& a, const Span& b) noexcept { return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin()); }
-    friend constexpr bool operator!=(const Span& a, const Span& b) noexcept { return !(a == b); }
-    friend constexpr bool operator<(const Span& a, const Span& b) noexcept { return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end()); }
-    friend constexpr bool operator<=(const Span& a, const Span& b) noexcept { return !(b < a); }
-    friend constexpr bool operator>(const Span& a, const Span& b) noexcept { return (b < a); }
-    friend constexpr bool operator>=(const Span& a, const Span& b) noexcept { return !(a < b); }
-
-    template <typename O> friend class Span;
-};
-
-/** Create a span to a container exposing data() and size().
- *
- * This correctly deals with constness: the returned Span's element type will be
- * whatever data() returns a pointer to. If either the passed container is const,
- * or its element type is const, the resulting span will have a const element type.
- *
- * std::span will have a constructor that implements this functionality directly.
- */
-template<typename A, int N>
-constexpr Span<A> MakeSpan(A (&a)[N]) { return Span<A>(a, N); }
-
-template<typename V>
-constexpr Span<typename std::remove_pointer<decltype(std::declval<V>().data())>::type> MakeSpan(V& v) { return Span<typename std::remove_pointer<decltype(std::declval<V>().data())>::type>(v.data(), v.size()); }
 
 /** Pop the last element off a span, and return a reference to that element. */
 template <typename T>
-T& SpanPopBack(Span<T>& span)
+T& SpanPopBack(std::span<T>& span)
 {
     size_t size = span.size();
-    assert(size > 0);
-    T& back = span[size - 1];
-    span = Span<T>(span.data(), size - 1);
+    T& back = span.back();
+    span = span.first(size - 1);
     return back;
 }
 
-#endif
+template <typename V>
+auto MakeByteSpan(const V& v) noexcept
+{
+    return std::as_bytes(std::span{v});
+}
+template <typename V>
+auto MakeWritableByteSpan(V&& v) noexcept
+{
+    return std::as_writable_bytes(std::span{std::forward<V>(v)});
+}
+
+// Helper functions to safely cast basic byte pointers to unsigned char pointers.
+inline unsigned char* UCharCast(char* c) { return reinterpret_cast<unsigned char*>(c); }
+inline unsigned char* UCharCast(unsigned char* c) { return c; }
+inline unsigned char* UCharCast(signed char* c) { return reinterpret_cast<unsigned char*>(c); }
+inline unsigned char* UCharCast(std::byte* c) { return reinterpret_cast<unsigned char*>(c); }
+inline const unsigned char* UCharCast(const char* c) { return reinterpret_cast<const unsigned char*>(c); }
+inline const unsigned char* UCharCast(const unsigned char* c) { return c; }
+inline const unsigned char* UCharCast(const signed char* c) { return reinterpret_cast<const unsigned char*>(c); }
+inline const unsigned char* UCharCast(const std::byte* c) { return reinterpret_cast<const unsigned char*>(c); }
+// Helper concept for the basic byte types.
+template <typename B>
+concept BasicByte = requires { UCharCast(std::span<B>{}.data()); };
+
+// Helper function to safely convert a span to a span<[const] unsigned char>.
+template <typename T, size_t N> constexpr auto UCharSpanCast(std::span<T, N> s) { return std::span<std::remove_pointer_t<decltype(UCharCast(s.data()))>, N>{UCharCast(s.data()), s.size()}; }
+
+/** Like the std::span constructor, but for (const) unsigned char member types only. Only works for (un)signed char containers. */
+template <typename V> constexpr auto MakeUCharSpan(const V& v) -> decltype(UCharSpanCast(std::span{v})) { return UCharSpanCast(std::span{v}); }
+
+#endif // BITCOIN_SPAN_H

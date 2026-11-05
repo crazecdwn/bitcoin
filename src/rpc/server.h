@@ -1,87 +1,42 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2019 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_RPC_SERVER_H
 #define BITCOIN_RPC_SERVER_H
 
-#include <amount.h>
 #include <rpc/request.h>
-
-#include <map>
-#include <stdint.h>
-#include <string>
-#include <functional>
-
+#include <rpc/util.h>
 #include <univalue.h>
 
-static const unsigned int DEFAULT_RPC_SERIALIZE_VERSION = 1;
-
-class CRPCCommand;
-
-namespace RPCServer
-{
-    void OnStarted(std::function<void ()> slot);
-    void OnStopped(std::function<void ()> slot);
-}
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 /** Query whether RPC is running */
 bool IsRPCRunning();
+
+/** Throw JSONRPCError if RPC is not running */
+void RpcInterruptionPoint();
 
 /**
  * Set the RPC warmup status.  When this is done, all RPC calls will error out
  * immediately with RPC_IN_WARMUP.
  */
 void SetRPCWarmupStatus(const std::string& newStatus);
+void SetRPCWarmupStarting();
 /* Mark warmup as done.  RPC calls will be processed from now on.  */
 void SetRPCWarmupFinished();
 
 /* returns the current warmup state.  */
 bool RPCIsInWarmup(std::string *outStatus);
 
-/** Opaque base class for timers returned by NewTimerFunc.
- * This provides no methods at the moment, but makes sure that delete
- * cleans up the whole state.
- */
-class RPCTimerBase
-{
-public:
-    virtual ~RPCTimerBase() {}
-};
-
-/**
- * RPC timer "driver".
- */
-class RPCTimerInterface
-{
-public:
-    virtual ~RPCTimerInterface() {}
-    /** Implementation name */
-    virtual const char *Name() = 0;
-    /** Factory function for timers.
-     * RPC will call the function to create a timer that will call func in *millis* milliseconds.
-     * @note As the RPC mechanism is backend-neutral, it can use different implementations of timers.
-     * This is needed to cope with the case in which there is no HTTP server, but
-     * only GUI RPC console, and to break the dependency of pcserver on httprpc.
-     */
-    virtual RPCTimerBase* NewTimer(std::function<void()>& func, int64_t millis) = 0;
-};
-
-/** Set the factory function for timers */
-void RPCSetTimerInterface(RPCTimerInterface *iface);
-/** Set the factory function for timer, but only, if unset */
-void RPCSetTimerInterfaceIfUnset(RPCTimerInterface *iface);
-/** Unset factory function for timers */
-void RPCUnsetTimerInterface(RPCTimerInterface *iface);
-
-/**
- * Run func nSeconds from now.
- * Overrides previous timer <name> (if any).
- */
-void RPCRunLater(const std::string& name, std::function<void()> func, int64_t nSeconds);
-
-typedef UniValue(*rpcfn_type)(const JSONRPCRequest& jsonRequest);
+typedef RPCMethod (*RpcMethodFnType)();
 
 class CRPCCommand
 {
@@ -92,29 +47,43 @@ public:
     using Actor = std::function<bool(const JSONRPCRequest& request, UniValue& result, bool last_handler)>;
 
     //! Constructor taking Actor callback supporting multiple handlers.
-    CRPCCommand(std::string category, std::string name, Actor actor, std::vector<std::string> args, intptr_t unique_id)
+    CRPCCommand(std::string category, std::string name, Actor actor, std::vector<std::pair<std::string, bool>> args, intptr_t unique_id)
         : category(std::move(category)), name(std::move(name)), actor(std::move(actor)), argNames(std::move(args)),
           unique_id(unique_id)
     {
     }
 
-    //! Simplified constructor taking plain rpcfn_type function pointer.
-    CRPCCommand(const char* category, const char* name, rpcfn_type fn, std::initializer_list<const char*> args)
-        : CRPCCommand(category, name,
-                      [fn](const JSONRPCRequest& request, UniValue& result, bool) { result = fn(request); return true; },
-                      {args.begin(), args.end()}, intptr_t(fn))
+    //! Simplified constructor taking plain RpcMethodFnType function pointer.
+    CRPCCommand(std::string category, RpcMethodFnType fn)
+        : CRPCCommand(
+              category,
+              fn().m_name,
+              [fn](const JSONRPCRequest& request, UniValue& result, bool) { result = fn().HandleRequest(request); return true; },
+              fn().GetArgNames(),
+              intptr_t(fn))
     {
+        this->metadata_fn = fn;
     }
 
     std::string category;
     std::string name;
     Actor actor;
-    std::vector<std::string> argNames;
+    //! List of method arguments and whether they are named-only. Incoming RPC
+    //! requests contain a "params" field that can either be an array containing
+    //! unnamed arguments or an object containing named arguments. The
+    //! "argNames" vector is used in the latter case to transform the params
+    //! object into an array. Each argument in "argNames" gets mapped to a
+    //! unique position in the array, based on the order it is listed, unless
+    //! the argument is a named-only argument with argNames[x].second set to
+    //! true. Named-only arguments are combined into a JSON object that is
+    //! appended after other arguments, see transformNamedArguments for details.
+    std::vector<std::pair<std::string, bool>> argNames;
     intptr_t unique_id;
+    RpcMethodFnType metadata_fn{nullptr};
 };
 
 /**
- * Bitcoin RPC command dispatcher.
+ * RPC command dispatcher.
  */
 class CRPCTable
 {
@@ -122,7 +91,7 @@ private:
     std::map<std::string, std::vector<const CRPCCommand*>> mapCommands;
 public:
     CRPCTable();
-    std::string help(const std::string& name, const JSONRPCRequest& helpreq) const;
+    std::string help(std::string_view name, const JSONRPCRequest& helpreq) const;
 
     /**
      * Execute a method.
@@ -137,12 +106,18 @@ public:
     * @returns List of registered commands.
     */
     std::vector<std::string> listCommands() const;
+    /** Return a complete OpenRPC 1.4.1 document for registered commands. */
+    UniValue buildOpenRPCDoc(bool include_hidden = false) const;
 
+    /**
+     * Return all named arguments that need to be converted by the client from string to another JSON type
+     */
+    UniValue dumpArgMap(const JSONRPCRequest& request) const;
 
     /**
      * Appends a CRPCCommand to the dispatch table.
      *
-     * Returns false if RPC server is already running (dump concurrency protection).
+     * Precondition: RPC server is not running
      *
      * Commands with different method names but the same unique_id will
      * be considered aliases, and only the first registered method name will
@@ -151,7 +126,7 @@ public:
      * between calls based on method name, and aliased commands can also
      * register different names, types, and numbers of parameters.
      */
-    bool appendCommand(const std::string& name, const CRPCCommand* pcmd);
+    void appendCommand(const std::string& name, const CRPCCommand* pcmd);
     bool removeCommand(const std::string& name, const CRPCCommand* pcmd);
 };
 
@@ -162,9 +137,6 @@ extern CRPCTable tableRPC;
 void StartRPC();
 void InterruptRPC();
 void StopRPC();
-std::string JSONRPCExecBatch(const JSONRPCRequest& jreq, const UniValue& vReq);
-
-// Retrieves any serialization flags requested in command line argument
-int RPCSerializationFlags();
+UniValue JSONRPCExec(const JSONRPCRequest& jreq, bool catch_errors);
 
 #endif // BITCOIN_RPC_SERVER_H

@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2019 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -7,12 +7,14 @@
 
 #include <qt/guiutil.h>
 
+#include <primitives/transaction_identifier.h>
 #include <uint256.h>
 
 #include <QWidget>
 #include <QKeyEvent>
 
 class PlatformStyle;
+class TransactionDescDialog;
 class TransactionFilterProxy;
 class WalletModel;
 
@@ -35,6 +37,7 @@ class TransactionView : public QWidget
 
 public:
     explicit TransactionView(const PlatformStyle *platformStyle, QWidget *parent = nullptr);
+    ~TransactionView();
 
     void setModel(WalletModel *model);
 
@@ -52,21 +55,22 @@ public:
 
     enum ColumnWidths {
         STATUS_COLUMN_WIDTH = 30,
-        WATCHONLY_COLUMN_WIDTH = 23,
         DATE_COLUMN_WIDTH = 120,
         TYPE_COLUMN_WIDTH = 113,
         AMOUNT_MINIMUM_COLUMN_WIDTH = 120,
         MINIMUM_COLUMN_WIDTH = 23
     };
 
+protected:
+    void changeEvent(QEvent* e) override;
+
 private:
-    WalletModel *model;
-    TransactionFilterProxy *transactionProxyModel;
-    QTableView *transactionView;
+    WalletModel *model{nullptr};
+    TransactionFilterProxy *transactionProxyModel{nullptr};
+    QTableView *transactionView{nullptr};
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
-    QComboBox *watchOnlyWidget;
     QLineEdit *search_widget;
     QLineEdit *amountWidget;
 
@@ -75,16 +79,18 @@ private:
     QFrame *dateRangeWidget;
     QDateTimeEdit *dateFrom;
     QDateTimeEdit *dateTo;
-    QAction *abandonAction;
-    QAction *bumpFeeAction;
+    QAction *abandonAction{nullptr};
+    QAction *bumpFeeAction{nullptr};
+    QAction *copyAddressAction{nullptr};
+    QAction *copyLabelAction{nullptr};
 
     QWidget *createDateRangeWidget();
 
-    GUIUtil::TableViewLastColumnResizingFixer *columnResizingFixer;
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
-    virtual void resizeEvent(QResizeEvent* event);
+    const PlatformStyle* m_platform_style;
 
-    bool eventFilter(QObject *obj, QEvent *event);
+    QList<TransactionDescDialog*> m_opened_dialogs;
 
 private Q_SLOTS:
     void contextualMenu(const QPoint &);
@@ -98,9 +104,8 @@ private Q_SLOTS:
     void copyTxHex();
     void copyTxPlainText();
     void openThirdPartyTxUrl(QString url);
-    void updateWatchOnlyColumn(bool fHaveWatchOnly);
     void abandonTx();
-    void bumpFee();
+    void bumpFee(bool checked);
 
 Q_SIGNALS:
     void doubleClicked(const QModelIndex&);
@@ -108,17 +113,17 @@ Q_SIGNALS:
     /**  Fired when a message should be reported to the user */
     void message(const QString &title, const QString &message, unsigned int style);
 
-    void bumpedFee(const uint256& txid);
+    void bumpedFee(const Txid& txid);
 
 public Q_SLOTS:
     void chooseDate(int idx);
     void chooseType(int idx);
-    void chooseWatchonly(int idx);
     void changedAmount();
     void changedSearch();
     void exportClicked();
+    void closeOpenedDialogs();
     void focusTransaction(const QModelIndex&);
-    void focusTransaction(const uint256& txid);
+    void focusTransaction(const Txid& txid);
 };
 
 #endif // BITCOIN_QT_TRANSACTIONVIEW_H

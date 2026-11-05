@@ -1,9 +1,9 @@
-// Copyright (c) 2009-2020 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <amount.h>
 #include <coins.h>
+#include <consensus/amount.h>
 #include <consensus/tx_verify.h>
 #include <node/psbt.h>
 #include <policy/policy.h>
@@ -12,18 +12,29 @@
 
 #include <numeric>
 
+namespace node {
 PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 {
     // Go through each input and build status
     PSBTAnalysis result;
 
+    std::optional<CMutableTransaction> unsigned_tx = psbtx.GetUnsignedTx();
+    if (!unsigned_tx) {
+        result.SetInvalid("PSBT cannot be made into a valid transaction");
+        return result;
+    }
+    CMutableTransaction& mtx = *unsigned_tx;
+
     bool calc_fee = true;
 
     CAmount in_amt = 0;
 
-    result.inputs.resize(psbtx.tx->vin.size());
+    result.inputs.resize(psbtx.inputs.size());
 
-    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+    // PrecomputePSBTData calls GetUnsignedTx() which we checked already works
+    const PrecomputedTransactionData txdata = *PrecomputePSBTData(psbtx);
+
+    for (unsigned int i = 0; i < psbtx.inputs.size(); ++i) {
         PSBTInput& input = psbtx.inputs[i];
         PSBTInputAnalysis& input_analysis = result.inputs[i];
 
@@ -32,7 +43,7 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
         // Check for a UTXO
         CTxOut utxo;
-        if (psbtx.GetInputUTXO(utxo, i)) {
+        if (input.GetUTXO(utxo)) {
             if (!MoneyRange(utxo.nValue) || !MoneyRange(in_amt + utxo.nValue)) {
                 result.SetInvalid(strprintf("PSBT is not valid. Input %u has invalid value", i));
                 return result;
@@ -40,7 +51,7 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
             in_amt += utxo.nValue;
             input_analysis.has_utxo = true;
         } else {
-            if (input.non_witness_utxo && psbtx.tx->vin[i].prevout.n >= input.non_witness_utxo->vout.size()) {
+            if (input.non_witness_utxo && input.prev_out >= input.non_witness_utxo->vout.size()) {
                 result.SetInvalid(strprintf("PSBT is not valid. Input %u specifies invalid prevout", i));
                 return result;
             }
@@ -56,12 +67,13 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
         }
 
         // Check if it is final
-        if (!utxo.IsNull() && !PSBTInputSigned(input)) {
+        if (!PSBTInputSignedAndVerified(psbtx, i, &txdata)) {
             input_analysis.is_final = false;
 
             // Figure out what is missing
             SignatureData outdata;
-            bool complete = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, 1, &outdata);
+            const auto sign_result = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, /*options*/{}, &outdata);
+            bool complete = sign_result.has_value();
 
             // Things are missing
             if (!complete) {
@@ -86,7 +98,7 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
     // Calculate next role for PSBT by grabbing "minimum" PSBTInput next role
     result.next = PSBTRole::EXTRACTOR;
-    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+    for (unsigned int i = 0; i < psbtx.inputs.size(); ++i) {
         PSBTInputAnalysis& input_analysis = result.inputs[i];
         result.next = std::min(result.next, input_analysis.next);
     }
@@ -94,16 +106,16 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
     if (calc_fee) {
         // Get the output amount
-        CAmount out_amt = std::accumulate(psbtx.tx->vout.begin(), psbtx.tx->vout.end(), CAmount(0),
-            [](CAmount a, const CTxOut& b) {
-                if (!MoneyRange(a) || !MoneyRange(b.nValue) || !MoneyRange(a + b.nValue)) {
+        CAmount out_amt = std::accumulate(psbtx.outputs.begin(), psbtx.outputs.end(), CAmount(0),
+            [](CAmount a, const PSBTOutput& b) {
+                if (!MoneyRange(a) || !MoneyRange(b.amount) || !MoneyRange(a + b.amount)) {
                     return CAmount(-1);
                 }
-                return a += b.nValue;
+                return a += b.amount;
             }
         );
         if (!MoneyRange(out_amt)) {
-            result.SetInvalid(strprintf("PSBT is not valid. Output amount invalid"));
+            result.SetInvalid("PSBT is not valid. Output amount invalid");
             return result;
         }
 
@@ -112,29 +124,28 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
         result.fee = fee;
 
         // Estimate the size
-        CMutableTransaction mtx(*psbtx.tx);
-        CCoinsView view_dummy;
-        CCoinsViewCache view(&view_dummy);
+        CCoinsViewCache view{&CoinsViewEmpty::Get()};
         bool success = true;
 
-        for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+        for (unsigned int i = 0; i < psbtx.inputs.size(); ++i) {
             PSBTInput& input = psbtx.inputs[i];
             Coin newcoin;
 
-            if (!SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, 1, nullptr, true) || !psbtx.GetInputUTXO(newcoin.out, i)) {
+            const auto sign_result = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, nullptr, /*options=*/{});
+            if (!sign_result.has_value() || !input.GetUTXO(newcoin.out)) {
                 success = false;
                 break;
             } else {
                 mtx.vin[i].scriptSig = input.final_script_sig;
                 mtx.vin[i].scriptWitness = input.final_script_witness;
                 newcoin.nHeight = 1;
-                view.AddCoin(psbtx.tx->vin[i].prevout, std::move(newcoin), true);
+                view.AddCoin(input.GetOutPoint(), std::move(newcoin), true);
             }
         }
 
         if (success) {
             CTransaction ctx = CTransaction(mtx);
-            size_t size = GetVirtualTransactionSize(ctx, GetTransactionSigOpCost(ctx, view, STANDARD_SCRIPT_VERIFY_FLAGS));
+            size_t size(GetVirtualTransactionSize(ctx, GetTransactionSigOpCost(ctx, view, STANDARD_SCRIPT_VERIFY_FLAGS), ::nBytesPerSigOp));
             result.estimated_vsize = size;
             // Estimate fee rate
             CFeeRate feerate(fee, size);
@@ -145,3 +156,4 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
     return result;
 }
+} // namespace node

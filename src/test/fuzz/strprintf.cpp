@@ -1,18 +1,26 @@
-// Copyright (c) 2020 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
+#include <test/fuzz/util.h>
 #include <tinyformat.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-void test_one_input(const std::vector<uint8_t>& buffer)
+template <typename... Args>
+void fuzz_fmt(const std::string& fmt, const Args&... args)
+{
+    (void)tfm::format(tfm::RuntimeFormat{fmt}, args...);
+}
+
+FUZZ_TARGET(str_printf)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     const std::string format_string = fuzzed_data_provider.ConsumeRandomLengthString(64);
@@ -46,75 +54,26 @@ void test_one_input(const std::vector<uint8_t>& buffer)
     // Upstream bug report: https://github.com/c42f/tinyformat/issues/70
 
     try {
-        (void)strprintf(format_string, (signed char*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (unsigned char*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (void*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (bool*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (float*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (double*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (int16_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (uint16_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (int32_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (uint32_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (int64_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-    try {
-        (void)strprintf(format_string, (uint64_t*)nullptr);
-    } catch (const tinyformat::format_error&) {
-    }
-
-    try {
-        switch (fuzzed_data_provider.ConsumeIntegralInRange(0, 5)) {
-        case 0:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeRandomLengthString(32));
-            break;
-        case 1:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeRandomLengthString(32).c_str());
-            break;
-        case 2:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<signed char>());
-            break;
-        case 3:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<unsigned char>());
-            break;
-        case 4:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<char>());
-            break;
-        case 5:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeBool());
-            break;
-        }
+        CallOneOf(
+            fuzzed_data_provider,
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeRandomLengthString(32));
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeRandomLengthString(32).c_str());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<signed char>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<unsigned char>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<char>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeBool());
+            });
     } catch (const tinyformat::format_error&) {
     }
 
@@ -135,32 +94,32 @@ void test_one_input(const std::vector<uint8_t>& buffer)
     }
 
     try {
-        switch (fuzzed_data_provider.ConsumeIntegralInRange(0, 7)) {
-        case 0:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeFloatingPoint<float>());
-            break;
-        case 1:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeFloatingPoint<double>());
-            break;
-        case 2:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<int16_t>());
-            break;
-        case 3:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<uint16_t>());
-            break;
-        case 4:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<int32_t>());
-            break;
-        case 5:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<uint32_t>());
-            break;
-        case 6:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<int64_t>());
-            break;
-        case 7:
-            (void)strprintf(format_string, fuzzed_data_provider.ConsumeIntegral<uint64_t>());
-            break;
-        }
+        CallOneOf(
+            fuzzed_data_provider,
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeFloatingPoint<float>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeFloatingPoint<double>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<int16_t>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<uint16_t>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<int32_t>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<uint32_t>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<int64_t>());
+            },
+            [&] {
+                fuzz_fmt(format_string, fuzzed_data_provider.ConsumeIntegral<uint64_t>());
+            });
     } catch (const tinyformat::format_error&) {
     }
 }

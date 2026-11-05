@@ -1,13 +1,15 @@
-// Copyright (c) 2015-2020 The Bitcoin Core developers
+// Copyright (c) 2015-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <sync.h>
-#include <test/util/setup_common.h>
+#include <test/util/common.h>
 
 #include <boost/test/unit_test.hpp>
 
-BOOST_FIXTURE_TEST_SUITE(reverselock_tests, BasicTestingSetup)
+#include <stdexcept>
+
+BOOST_AUTO_TEST_SUITE(reverselock_tests)
 
 BOOST_AUTO_TEST_CASE(reverselock_basics)
 {
@@ -15,8 +17,10 @@ BOOST_AUTO_TEST_CASE(reverselock_basics)
     WAIT_LOCK(mutex, lock);
 
     BOOST_CHECK(lock.owns_lock());
+    AssertLockHeld(mutex);
     {
-        REVERSE_LOCK(lock);
+        REVERSE_LOCK(lock, mutex);
+        AssertLockNotHeld(mutex);
         BOOST_CHECK(!lock.owns_lock());
     }
     BOOST_CHECK(lock.owns_lock());
@@ -31,9 +35,9 @@ BOOST_AUTO_TEST_CASE(reverselock_multiple)
 
     // Make sure undoing two locks succeeds
     {
-        REVERSE_LOCK(lock);
+        REVERSE_LOCK(lock, mutex);
         BOOST_CHECK(!lock.owns_lock());
-        REVERSE_LOCK(lock2);
+        REVERSE_LOCK(lock2, mutex2);
         BOOST_CHECK(!lock2.owns_lock());
     }
     BOOST_CHECK(lock.owns_lock());
@@ -48,12 +52,14 @@ BOOST_AUTO_TEST_CASE(reverselock_errors)
     WAIT_LOCK(mutex, lock);
 
 #ifdef DEBUG_LOCKORDER
+    bool prev = g_debug_lockorder_abort;
+    g_debug_lockorder_abort = false;
+
     // Make sure trying to reverse lock a previous lock fails
-    try {
-        REVERSE_LOCK(lock2);
-        BOOST_CHECK(false); // REVERSE_LOCK(lock2) succeeded
-    } catch(...) { }
+    BOOST_CHECK_EXCEPTION(REVERSE_LOCK(lock2, mutex2), std::logic_error, HasReason{"mutex2 was not most recent critical section locked"});
     BOOST_CHECK(lock2.owns_lock());
+
+    g_debug_lockorder_abort = prev;
 #endif
 
     // Make sure trying to reverse lock an unlocked lock fails
@@ -61,14 +67,9 @@ BOOST_AUTO_TEST_CASE(reverselock_errors)
 
     BOOST_CHECK(!lock.owns_lock());
 
-    bool failed = false;
-    try {
-        REVERSE_LOCK(lock);
-    } catch(...) {
-        failed = true;
-    }
+    BOOST_CHECK_EXCEPTION(REVERSE_LOCK(lock, mutex), std::system_error,
+                          [](const std::system_error& e) { return e.code() == std::errc::operation_not_permitted; });
 
-    BOOST_CHECK(failed);
     BOOST_CHECK(!lock.owns_lock());
 
     // Locking the original lock after it has been taken by a reverse lock
@@ -78,11 +79,10 @@ BOOST_AUTO_TEST_CASE(reverselock_errors)
     lock.lock();
     BOOST_CHECK(lock.owns_lock());
     {
-        REVERSE_LOCK(lock);
+        REVERSE_LOCK(lock, mutex);
         BOOST_CHECK(!lock.owns_lock());
     }
 
-    BOOST_CHECK(failed);
     BOOST_CHECK(lock.owns_lock());
 }
 

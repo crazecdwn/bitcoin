@@ -1,64 +1,74 @@
-// Copyright (c) 2012-2020 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
 #include <interfaces/chain.h>
-#include <node/context.h>
-#include <optional.h>
+#include <interfaces/handler.h>
+#include <kernel/chainparams.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <sync.h>
 #include <test/util/mining.h>
 #include <test/util/setup_common.h>
-#include <test/util/wallet.h>
-#include <validationinterface.h>
+#include <test/util/time.h>
+#include <uint256.h>
+#include <util/check.h>
+#include <validation.h>
+#include <wallet/receive.h>
+#include <wallet/sqlite.h>
+#include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <wallet/walletutil.h>
 
-static void WalletBalance(benchmark::State& state, const bool set_dirty, const bool add_watchonly, const bool add_mine)
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace wallet {
+static void WalletBalance(benchmark::Bench& bench, const bool set_dirty, const bool add_mine)
 {
-    TestingSetup test_setup{
-        CBaseChainParams::REGTEST,
-        /* extra_args */ {
-            "-nodebuglogfile",
-            "-nodebug",
-        },
-    };
+    const auto test_setup = MakeNoLogFileContext<const TestingSetup>();
 
     const auto& ADDRESS_WATCHONLY = ADDRESS_BCRT1_UNSPENDABLE;
 
-    NodeContext node;
-    std::unique_ptr<interfaces::Chain> chain = interfaces::MakeChain(node);
-    CWallet wallet{chain.get(), WalletLocation(), WalletDatabase::CreateMock()};
+    // Set clock to genesis block, so the descriptors/keys creation time don't interfere with the blocks scanning process.
+    // The reason is 'generatetoaddress', which creates a chain with deterministic timestamps in the past.
+    FakeNodeClock clock{test_setup->m_node.chainman->GetParams().GenesisBlock().Time()};
+    CWallet wallet{test_setup->m_node.chain.get(), "", MakeInMemoryWalletDatabase()};
     {
-        wallet.SetupLegacyScriptPubKeyMan();
-        bool first_run;
-        if (wallet.LoadWallet(first_run) != DBErrors::LOAD_OK) assert(false);
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetupDescriptorScriptPubKeyMans();
     }
-    auto handler = chain->handleNotifications({&wallet, [](CWallet*) {}});
+    auto handler = test_setup->m_node.chain->handleNotifications({&wallet, [](CWallet*) {}});
 
-    const Optional<std::string> address_mine{add_mine ? Optional<std::string>{getnewaddress(wallet)} : nullopt};
-    if (add_watchonly) importaddress(wallet, ADDRESS_WATCHONLY);
+    const std::optional<std::string> address_mine{add_mine ? std::optional<std::string>{getnewaddress(wallet)} : std::nullopt};
 
     for (int i = 0; i < 100; ++i) {
-        generatetoaddress(test_setup.m_node, address_mine.get_value_or(ADDRESS_WATCHONLY));
-        generatetoaddress(test_setup.m_node, ADDRESS_WATCHONLY);
+        generatetoaddress(test_setup->m_node, address_mine.value_or(ADDRESS_WATCHONLY));
+        generatetoaddress(test_setup->m_node, ADDRESS_WATCHONLY);
     }
-    SyncWithValidationInterfaceQueue();
+    // Calls SyncWithValidationInterfaceQueue
+    wallet.chain().waitForNotificationsIfTipChanged(uint256::ZERO);
 
-    auto bal = wallet.GetBalance(); // Cache
+    auto bal = GetBalance(wallet); // Cache
 
-    while (state.KeepRunning()) {
-        if (set_dirty) wallet.MarkDirty();
-        bal = wallet.GetBalance();
-        if (add_mine) assert(bal.m_mine_trusted > 0);
-        if (add_watchonly) assert(bal.m_watchonly_trusted > 0);
-    }
+    bench.setup([&] {
+            if (set_dirty) wallet.MarkDirty();
+        })
+        .run([&] {
+            bal = GetBalance(wallet);
+            ankerl::nanobench::doNotOptimizeAway(bal);
+            assert(add_mine == (bal.m_mine_trusted > 0));
+        });
 }
 
-static void WalletBalanceDirty(benchmark::State& state) { WalletBalance(state, /* set_dirty */ true, /* add_watchonly */ true, /* add_mine */ true); }
-static void WalletBalanceClean(benchmark::State& state) { WalletBalance(state, /* set_dirty */ false, /* add_watchonly */ true, /* add_mine */ true); }
-static void WalletBalanceMine(benchmark::State& state) { WalletBalance(state, /* set_dirty */ false, /* add_watchonly */ false, /* add_mine */ true); }
-static void WalletBalanceWatch(benchmark::State& state) { WalletBalance(state, /* set_dirty */ false, /* add_watchonly */ true, /* add_mine */ false); }
+static void WalletBalanceDirty(benchmark::Bench& bench) { WalletBalance(bench, /*set_dirty=*/true, /*add_mine=*/true); }
+static void WalletBalanceClean(benchmark::Bench& bench) { WalletBalance(bench, /*set_dirty=*/false, /*add_mine=*/true); }
+static void WalletBalanceWatch(benchmark::Bench& bench) { WalletBalance(bench, /*set_dirty=*/false, /*add_mine=*/false); }
 
-BENCHMARK(WalletBalanceDirty, 2500);
-BENCHMARK(WalletBalanceClean, 8000);
-BENCHMARK(WalletBalanceMine, 16000);
-BENCHMARK(WalletBalanceWatch, 8000);
+BENCHMARK(WalletBalanceDirty);
+BENCHMARK(WalletBalanceClean);
+BENCHMARK(WalletBalanceWatch);
+} // namespace wallet

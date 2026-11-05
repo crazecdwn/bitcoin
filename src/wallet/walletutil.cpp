@@ -1,25 +1,28 @@
-// Copyright (c) 2017-2019 The Bitcoin Core developers
+// Copyright (c) 2017-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/walletutil.h>
 
-#include <logging.h>
-#include <util/system.h>
+#include <chainparams.h>
+#include <common/args.h>
+#include <key_io.h>
+#include <util/log.h>
 
+namespace wallet {
 fs::path GetWalletDir()
 {
     fs::path path;
 
     if (gArgs.IsArgSet("-walletdir")) {
-        path = gArgs.GetArg("-walletdir", "");
+        path = gArgs.GetPathArg("-walletdir");
         if (!fs::is_directory(path)) {
             // If the path specified doesn't exist, we return the deliberately
             // invalid empty string.
             path = "";
         }
     } else {
-        path = GetDataDir();
+        path = gArgs.GetDataDirNet();
         // If a wallets directory exists, use that, otherwise default to GetDataDir
         if (fs::is_directory(path / "wallets")) {
             path /= "wallets";
@@ -29,81 +32,84 @@ fs::path GetWalletDir()
     return path;
 }
 
-static bool IsBerkeleyBtree(const fs::path& path)
+WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& addr_type, bool internal)
 {
-    if (!fs::exists(path)) return false;
+    int64_t creation_time = GetTime();
 
-    // A Berkeley DB Btree file has at least 4K.
-    // This check also prevents opening lock files.
-    boost::system::error_code ec;
-    auto size = fs::file_size(path, ec);
-    if (ec) LogPrintf("%s: %s %s\n", __func__, ec.message(), path.string());
-    if (size < 4096) return false;
+    std::string xpub = EncodeExtPubKey(master_key);
 
-    fsbridge::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
+    // Build descriptor string
+    std::string desc_prefix;
+    std::string desc_suffix = "/*)";
+    switch (addr_type) {
+    case OutputType::LEGACY: {
+        desc_prefix = "pkh(" + xpub + "/44h";
+        break;
+    }
+    case OutputType::P2SH_SEGWIT: {
+        desc_prefix = "sh(wpkh(" + xpub + "/49h";
+        desc_suffix += ')';
+        break;
+    }
+    case OutputType::BECH32: {
+        desc_prefix = "wpkh(" + xpub + "/84h";
+        break;
+    }
+    case OutputType::BECH32M: {
+        desc_prefix = "tr(" + xpub + "/86h";
+        break;
+    }
+    case OutputType::UNKNOWN: {
+        // We should never have a DescriptorScriptPubKeyMan for an UNKNOWN OutputType,
+        // so if we get to this point something is wrong
+        assert(false);
+    }
+    } // no default case, so the compiler can warn about missing cases
+    assert(!desc_prefix.empty());
 
-    file.seekg(12, std::ios::beg); // Magic bytes start at offset 12
-    uint32_t data = 0;
-    file.read((char*) &data, sizeof(data)); // Read 4 bytes of file to compare against magic
-
-    // Berkeley DB Btree magic bytes, from:
-    //  https://github.com/file/file/blob/5824af38469ec1ca9ac3ffd251e7afe9dc11e227/magic/Magdir/database#L74-L75
-    //  - big endian systems - 00 05 31 62
-    //  - little endian systems - 62 31 05 00
-    return data == 0x00053162 || data == 0x62310500;
-}
-
-std::vector<fs::path> ListWalletDir()
-{
-    const fs::path wallet_dir = GetWalletDir();
-    const size_t offset = wallet_dir.string().size() + 1;
-    std::vector<fs::path> paths;
-    boost::system::error_code ec;
-
-    for (auto it = fs::recursive_directory_iterator(wallet_dir, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) {
-            LogPrintf("%s: %s %s\n", __func__, ec.message(), it->path().string());
-            continue;
-        }
-
-        // Get wallet path relative to walletdir by removing walletdir from the wallet path.
-        // This can be replaced by boost::filesystem::lexically_relative once boost is bumped to 1.60.
-        const fs::path path = it->path().string().substr(offset);
-
-        if (it->status().type() == fs::directory_file && IsBerkeleyBtree(it->path() / "wallet.dat")) {
-            // Found a directory which contains wallet.dat btree file, add it as a wallet.
-            paths.emplace_back(path);
-        } else if (it.level() == 0 && it->symlink_status().type() == fs::regular_file && IsBerkeleyBtree(it->path())) {
-            if (it->path().filename() == "wallet.dat") {
-                // Found top-level wallet.dat btree file, add top level directory ""
-                // as a wallet.
-                paths.emplace_back();
-            } else {
-                // Found top-level btree file not called wallet.dat. Current bitcoin
-                // software will never create these files but will allow them to be
-                // opened in a shared database environment for backwards compatibility.
-                // Add it to the list of available wallets.
-                paths.emplace_back(path);
-            }
-        }
+    // Mainnet derives at 0', testnet and regtest derive at 1'
+    if (Params().IsTestChain()) {
+        desc_prefix += "/1h";
+    } else {
+        desc_prefix += "/0h";
     }
 
-    return paths;
+    std::string internal_path = internal ? "/1" : "/0";
+    std::string desc_str = desc_prefix + "/0h" + internal_path + desc_suffix;
+
+    // Make the descriptor
+    FlatSigningProvider keys;
+    std::string error;
+    std::vector<std::unique_ptr<Descriptor>> desc = Parse(desc_str, keys, error, false);
+    WalletDescriptor w_desc(std::move(desc.at(0)), creation_time, 0, 0, 0);
+    return w_desc;
 }
 
-WalletLocation::WalletLocation(const std::string& name)
-    : m_name(name)
-    , m_path(fs::absolute(name, GetWalletDir()))
+void WalletDescriptor::UpdateFrom(const WalletDescriptor& other)
 {
-}
-
-bool WalletLocation::Exists() const
-{
-    fs::path path = m_path;
-    // For the default wallet, check specifically for the wallet.dat file
-    if (m_name.empty()) {
-        path = fs::absolute("wallet.dat", m_path);
+    if (!IsCanonicallyEquivalent(other)) {
+        return;
     }
-    return fs::symlink_status(path).type() != fs::file_not_found;
+    range_start = other.range_start;
+    next_index = other.next_index;
+    range_end = other.range_end;
+    creation_time = other.creation_time;
+    cache = other.cache;
 }
+
+uint256 WalletDescriptor::GetCanonicalHash() const
+{
+    if (!m_canonical_hash) {
+        m_canonical_hash.emplace();
+        std::string canonical = descriptor->ToCanonicalString();
+        CSHA256().Write((unsigned char*)canonical.data(), canonical.size()).Finalize(m_canonical_hash->begin());
+    }
+    return *m_canonical_hash;
+}
+
+bool WalletDescriptor::IsCanonicallyEquivalent(const WalletDescriptor& other) const
+{
+    return GetCanonicalHash() == other.GetCanonicalHash();
+}
+
+} // namespace wallet

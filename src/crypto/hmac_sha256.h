@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2018 The Bitcoin Core developers
+// Copyright (c) 2014-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -7,8 +7,7 @@
 
 #include <crypto/sha256.h>
 
-#include <stdint.h>
-#include <stdlib.h>
+#include <cstddef>
 
 /** A hasher class for HMAC-SHA-256. */
 class CHMAC_SHA256
@@ -18,7 +17,7 @@ private:
     CSHA256 inner;
 
 public:
-    static const size_t OUTPUT_SIZE = 32;
+    static constexpr size_t OUTPUT_SIZE{32};
 
     CHMAC_SHA256(const unsigned char* key, size_t keylen);
     CHMAC_SHA256& Write(const unsigned char* data, size_t len)

@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-# Copyright (c) 2018-2019 The Bitcoin Core developers
+# Copyright (c) 2018-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 import sys
 import re
-
-MAPPING = {
-    'core_read.cpp': 'core_io.cpp',
-    'core_write.cpp': 'core_io.cpp',
-}
 
 # Directories with header-based modules, where the assumption that .cpp files
 # define functions and variables declared in corresponding .h files is
@@ -19,8 +14,6 @@ HEADER_MODULE_PATHS = [
 ]
 
 def module_name(path):
-    if path in MAPPING:
-        path = MAPPING[path]
     if any(path.startswith(dirpath) for dirpath in HEADER_MODULE_PATHS):
         return path
     if path.endswith(".h"):
@@ -32,7 +25,7 @@ def module_name(path):
     return None
 
 files = dict()
-deps = dict()
+deps: dict[str, set[str]] = dict()
 
 RE = re.compile("^#include <(.*)>")
 
@@ -49,7 +42,7 @@ for arg in sys.argv[1:]:
 # TODO: implement support for multiple include directories
 for arg in sorted(files.keys()):
     module = files[arg]
-    with open(arg, 'r', encoding="utf8") as f:
+    with open(arg, 'r') as f:
         for line in f:
             match = RE.match(line)
             if match:
@@ -59,12 +52,12 @@ for arg in sorted(files.keys()):
                     deps[module].add(included_module)
 
 # Loop to find the shortest (remaining) circular dependency
-have_cycle = False
+have_cycle: bool = False
 while True:
     shortest_cycle = None
     for module in sorted(deps.keys()):
         # Build the transitive closure of dependencies of module
-        closure = dict()
+        closure: dict[str, list[str]] = dict()
         for dep in deps[module]:
             closure[dep] = []
         while True:

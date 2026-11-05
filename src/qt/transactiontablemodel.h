@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2018 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -33,11 +33,10 @@ public:
 
     enum ColumnIndex {
         Status = 0,
-        Watchonly = 1,
-        Date = 2,
-        Type = 3,
-        ToAddress = 4,
-        Amount = 5
+        Date = 1,
+        Type = 2,
+        ToAddress = 3,
+        Amount = 4
     };
 
     /** Roles to get specific information from a transaction row.
@@ -48,10 +47,6 @@ public:
         TypeRole = Qt::UserRole,
         /** Date and time this transaction was created */
         DateRole,
-        /** Watch-only boolean */
-        WatchonlyRole,
-        /** Watch-only icon */
-        WatchonlyDecorationRole,
         /** Long description (HTML format) */
         LongDescriptionRole,
         /** Address of transaction */
@@ -76,11 +71,11 @@ public:
         RawDecorationRole,
     };
 
-    int rowCount(const QModelIndex &parent) const;
-    int columnCount(const QModelIndex &parent) const;
-    QVariant data(const QModelIndex &index, int role) const;
-    QVariant headerData(int section, Qt::Orientation orientation, int role) const;
-    QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const;
+    int rowCount(const QModelIndex &parent) const override;
+    int columnCount(const QModelIndex &parent) const override;
+    QVariant data(const QModelIndex &index, int role) const override;
+    QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
+    QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const override;
     bool processingQueuedTransactions() const { return fProcessingQueuedTransactions; }
 
 private:
@@ -89,7 +84,7 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     QStringList columns;
     TransactionTablePriv *priv;
-    bool fProcessingQueuedTransactions;
+    bool fProcessingQueuedTransactions{false};
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
@@ -101,10 +96,9 @@ private:
     QString formatTxDate(const TransactionRecord *wtx) const;
     QString formatTxType(const TransactionRecord *wtx) const;
     QString formatTxToAddress(const TransactionRecord *wtx, bool tooltip) const;
-    QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, BitcoinUnits::SeparatorStyle separators=BitcoinUnits::separatorStandard) const;
+    QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, BitcoinUnits::SeparatorStyle separators=BitcoinUnits::SeparatorStyle::STANDARD) const;
     QString formatTooltip(const TransactionRecord *rec) const;
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
-    QVariant txWatchonlyDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
 
 public Q_SLOTS:

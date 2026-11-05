@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2018 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -45,18 +45,18 @@ public:
     const QString &getReturnValue() const { return returnValue; }
 
 public Q_SLOTS:
-    void done(int retval);
+    void done(int retval) override;
 
 private:
     Ui::AddressBookPage *ui;
-    AddressTableModel *model;
+    AddressTableModel* model{nullptr};
     Mode mode;
     Tabs tab;
     QString returnValue;
     AddressBookSortFilterProxyModel *proxyModel;
     QMenu *contextMenu;
-    QAction *deleteAction; // to be able to explicitly disable it
     QString newAddressToSelect;
+    void updateWindowsTitleWithWalletName();
 
 private Q_SLOTS:
     /** Delete currently selected address entry */
@@ -78,9 +78,6 @@ private Q_SLOTS:
     void contextualMenu(const QPoint &point);
     /** New entry/entries were added to address table */
     void selectNewAddress(const QModelIndex &parent, int begin, int /*end*/);
-
-Q_SIGNALS:
-    void sendCoins(QString addr);
 };
 
 #endif // BITCOIN_QT_ADDRESSBOOKPAGE_H

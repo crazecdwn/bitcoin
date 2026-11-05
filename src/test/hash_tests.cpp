@@ -1,16 +1,57 @@
-// Copyright (c) 2013-2020 The Bitcoin Core developers
+// Copyright (c) 2013-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <clientversion.h>
+#include <crypto/common.h>
 #include <crypto/siphash.h>
 #include <hash.h>
+#include <test/data/siphash.json.h>
+#include <test/util/json.h>
 #include <test/util/setup_common.h>
+#include <uint256.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(hash_tests, BasicTestingSetup)
+
+static uint64_t FromHex64(const UniValue& value) { return ToIntegral<uint64_t>(value.get_str(), /*base=*/16).value(); }
+static uint256 FromHex256(const UniValue& value) { return uint256{ParseHex(value.get_str())}; }
+static bool HasByteLength(const UniValue& value, size_t length) { return value.get_str().size() == 2 * length; }
+
+static uint64_t CalculateSipHash24(const UniValue& input, uint64_t k0, uint64_t k1)
+{
+    CSipHasher hasher{k0, k1};
+    for (auto& block : input.getValues()) {
+        hasher.Write(ParseHex(block.get_str()));
+    }
+    const uint64_t result{hasher.Finalize()};
+    BOOST_CHECK_EQUAL(hasher.Finalize(), result);
+    return result;
+}
+
+static uint64_t CalculateSipHash13UJ(const UniValue& input, uint64_t k0, uint64_t k1, bool normal_as_jumbo)
+{
+    SipHasher13UJ hasher{k0, k1};
+    for (auto& value : input.getValues()) {
+        const auto block{ParseHex(value.get_str())};
+        if (block.size() == sizeof(uint64_t)) {
+            if (!normal_as_jumbo) {
+                hasher.Write(ReadLE64(block.data()));
+            } else {
+                uint256 data256{};
+                WriteLE64(data256.data(), ReadLE64(block.data()));
+                hasher.WriteJumbo(data256);
+            }
+        } else {
+            BOOST_REQUIRE_EQUAL(block.size(), uint256::size());
+            hasher.WriteJumbo(uint256{block});
+        }
+    }
+    const uint64_t result{hasher.Finalize()};
+    BOOST_CHECK_EQUAL(hasher.Finalize(), result);
+    return result;
+}
 
 BOOST_AUTO_TEST_CASE(murmurhash3)
 {
@@ -56,7 +97,7 @@ BOOST_AUTO_TEST_CASE(murmurhash3)
    ...
    in = 00 01 02 ... 3e (63 bytes)
 
-   from: https://131002.net/siphash/siphash24.c
+   from: https://github.com/veorq/SipHash/blob/master/vectors.h
 */
 uint64_t siphash_4_2_testvec[] = {
     0x726fdb47dd0e0e31, 0x74f839c593dc67fd, 0x0d6c8009d9a94f5a, 0x85676696d7fb7e2d,
@@ -82,68 +123,80 @@ BOOST_AUTO_TEST_CASE(siphash)
     CSipHasher hasher(0x0706050403020100ULL, 0x0F0E0D0C0B0A0908ULL);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x726fdb47dd0e0e31ull);
     static const unsigned char t0[1] = {0};
-    hasher.Write(t0, 1);
+    hasher.Write(t0);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x74f839c593dc67fdull);
     static const unsigned char t1[7] = {1,2,3,4,5,6,7};
-    hasher.Write(t1, 7);
+    hasher.Write(t1);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x93f5f5799a932462ull);
     hasher.Write(0x0F0E0D0C0B0A0908ULL);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x3f2acc7f57c29bdbull);
     static const unsigned char t2[2] = {16,17};
-    hasher.Write(t2, 2);
+    hasher.Write(t2);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x4bc1b3f0968dd39cull);
     static const unsigned char t3[9] = {18,19,20,21,22,23,24,25,26};
-    hasher.Write(t3, 9);
+    hasher.Write(t3);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x2f2e6163076bcfadull);
     static const unsigned char t4[5] = {27,28,29,30,31};
-    hasher.Write(t4, 5);
+    hasher.Write(t4);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x7127512f72f27cceull);
     hasher.Write(0x2726252423222120ULL);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0x0e3ea96b5304a7d0ull);
     hasher.Write(0x2F2E2D2C2B2A2928ULL);
     BOOST_CHECK_EQUAL(hasher.Finalize(),  0xe612a3cb9ecba951ull);
 
-    BOOST_CHECK_EQUAL(SipHashUint256(0x0706050403020100ULL, 0x0F0E0D0C0B0A0908ULL, uint256S("1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100")), 0x7127512f72f27cceull);
-
     // Check test vectors from spec, one byte at a time
     CSipHasher hasher2(0x0706050403020100ULL, 0x0F0E0D0C0B0A0908ULL);
-    for (uint8_t x=0; x<ARRAYLEN(siphash_4_2_testvec); ++x)
+    for (uint8_t x=0; x<std::size(siphash_4_2_testvec); ++x)
     {
         BOOST_CHECK_EQUAL(hasher2.Finalize(), siphash_4_2_testvec[x]);
-        hasher2.Write(&x, 1);
+        hasher2.Write(std::span{&x, 1});
     }
     // Check test vectors from spec, eight bytes at a time
     CSipHasher hasher3(0x0706050403020100ULL, 0x0F0E0D0C0B0A0908ULL);
-    for (uint8_t x=0; x<ARRAYLEN(siphash_4_2_testvec); x+=8)
+    for (uint8_t x=0; x<std::size(siphash_4_2_testvec); x+=8)
     {
         BOOST_CHECK_EQUAL(hasher3.Finalize(), siphash_4_2_testvec[x]);
         hasher3.Write(uint64_t(x)|(uint64_t(x+1)<<8)|(uint64_t(x+2)<<16)|(uint64_t(x+3)<<24)|
                      (uint64_t(x+4)<<32)|(uint64_t(x+5)<<40)|(uint64_t(x+6)<<48)|(uint64_t(x+7)<<56));
     }
 
-    CHashWriter ss(SER_DISK, CLIENT_VERSION);
+    HashWriter ss{};
     CMutableTransaction tx;
-    // Note these tests were originally written with tx.nVersion=1
+    // Note these tests were originally written with tx.version=1
     // and the test would be affected by default tx version bumps if not fixed.
-    tx.nVersion = 1;
-    ss << tx;
-    BOOST_CHECK_EQUAL(SipHashUint256(1, 2, ss.GetHash()), 0x79751e980c2a0a35ULL);
+    tx.version = 1;
+    ss << TX_WITH_WITNESS(tx);
+    BOOST_CHECK_EQUAL(PresaltedSipHasher(1, 2)(ss.GetHash()), 0x79751e980c2a0a35ULL);
+}
 
-    // Check consistency between CSipHasher and SipHashUint256[Extra].
-    FastRandomContext ctx;
-    for (int i = 0; i < 16; ++i) {
-        uint64_t k1 = ctx.rand64();
-        uint64_t k2 = ctx.rand64();
-        uint256 x = InsecureRand256();
-        uint32_t n = ctx.rand32();
-        uint8_t nb[4];
-        WriteLE32(nb, n);
-        CSipHasher sip256(k1, k2);
-        sip256.Write(x.begin(), 32);
-        CSipHasher sip288 = sip256;
-        sip288.Write(nb, 4);
-        BOOST_CHECK_EQUAL(SipHashUint256(k1, k2, x), sip256.Finalize());
-        BOOST_CHECK_EQUAL(SipHashUint256Extra(k1, k2, x, n), sip288.Finalize());
+BOOST_AUTO_TEST_CASE(siphash_test_vectors)
+{
+    for (UniValue tests{read_json(json_tests::siphash)}; auto& test : tests.getValues()) {
+        const uint64_t k0{FromHex64(test["key"][0])}, k1{FromHex64(test["key"][1])};
+        auto& input{test["input"]};
+        const bool starts_with_hash{!input.empty() && HasByteLength(input[0], uint256::size())};
+        const bool hash_only{starts_with_hash && input.size() == 1};
+        const bool hash_extra{starts_with_hash && input.size() == 2};
+        const uint64_t expected24{FromHex64(test["expected"]["siphash24"])};
+        BOOST_CHECK_EQUAL(CalculateSipHash24(input, k0, k1), expected24);
+        if (hash_only) {
+            BOOST_CHECK_EQUAL(PresaltedSipHasher(k0, k1)(FromHex256(input[0])), expected24);
+        } else if (hash_extra && HasByteLength(input[1], sizeof(uint32_t))) {
+            const auto extra{ParseHex(input[1].get_str())};
+            BOOST_CHECK_EQUAL(PresaltedSipHasher(k0, k1)(FromHex256(input[0]), ReadLE32(extra.data())), expected24);
+        }
+        if (auto& expected_value{test["expected"]["siphash13uj"]}; !expected_value.isNull()) {
+            const uint64_t expected13uj{FromHex64(expected_value)};
+            BOOST_CHECK_EQUAL(CalculateSipHash13UJ(input, k0, k1, /*normal_as_jumbo=*/false), expected13uj);
+            BOOST_CHECK_EQUAL(CalculateSipHash13UJ(input, k0, k1, /*normal_as_jumbo=*/true), expected13uj);
+            const SipHasher13UJ fixed_hasher{k0, k1};
+            if (hash_only) {
+                BOOST_CHECK_EQUAL(fixed_hasher.Hash(FromHex256(input[0])), expected13uj);
+            } else if (hash_extra && HasByteLength(input[1], sizeof(uint64_t))) {
+                const auto extra{ParseHex(input[1].get_str())};
+                BOOST_CHECK_EQUAL(fixed_hasher.Hash(FromHex256(input[0]), ReadLE64(extra.data())), expected13uj);
+            }
+        }
     }
 }
 

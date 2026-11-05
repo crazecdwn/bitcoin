@@ -1,290 +1,270 @@
-// Copyright (c) 2017-2019 The Bitcoin Core developers
+// Copyright (c) 2017-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <index/txindex.h>
-#include <shutdown.h>
-#include <ui_interface.h>
-#include <util/system.h>
-#include <util/translation.h>
+
+#include <chain.h>
+#include <common/args.h>
+#include <crypto/siphash.h>
+#include <dbwrapper.h>
+#include <flatfile.h>
+#include <index/base.h>
+#include <index/disktxpos.h>
+#include <index/txindex_key.h>
+#include <interfaces/chain.h>
+#include <node/blockstorage.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <random.h>
+#include <serialize.h>
+#include <streams.h>
+#include <sync.h>
+#include <tinyformat.h>
+#include <uint256.h>
+#include <util/fs.h>
+#include <util/log.h>
+#include <util/string.h>
 #include <validation.h>
 
-#include <boost/thread.hpp>
-
-constexpr char DB_BEST_BLOCK = 'B';
-constexpr char DB_TXINDEX = 't';
-constexpr char DB_TXINDEX_BLOCK = 'T';
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 std::unique_ptr<TxIndex> g_txindex;
 
-struct CDiskTxPos : public FlatFilePos
+namespace {
+SipHasher13UJ ReadOrCreateTxidHasher(CDBWrapper& db)
 {
-    unsigned int nTxOffset; // after header
-
-    ADD_SERIALIZE_METHODS;
-
-    template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action) {
-        READWRITEAS(FlatFilePos, *this);
-        READWRITE(VARINT(nTxOffset));
+    std::pair<uint64_t, uint64_t> salt;
+    if (!db.Read(txindex::DB_TXID_HASH_SALT, salt)) {
+        FastRandomContext rng{};
+        salt = {rng.rand64(), rng.rand64()};
+        db.Write(txindex::DB_TXID_HASH_SALT, salt, /*fSync=*/true);
     }
+    return SipHasher13UJ{salt.first, salt.second};
+}
+} // namespace
 
-    CDiskTxPos(const FlatFilePos &blockIn, unsigned int nTxOffsetIn) : FlatFilePos(blockIn.nFile, blockIn.nPos), nTxOffset(nTxOffsetIn) {
-    }
-
-    CDiskTxPos() {
-        SetNull();
-    }
-
-    void SetNull() {
-        FlatFilePos::SetNull();
-        nTxOffset = 0;
-    }
-};
-
-/**
- * Access to the txindex database (indexes/txindex/)
- *
- * The database stores a block locator of the chain the database is synced to
- * so that the TxIndex can efficiently determine the point it last stopped at.
- * A locator is used instead of a simple hash of the chain tip because blocks
- * and block index entries may not be flushed to disk until after this database
- * is updated.
- */
+/** Access to the txindex database (indexes/txindex/) */
 class TxIndex::DB : public BaseIndex::DB
 {
 public:
     explicit DB(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);
 
-    /// Read the disk location of the transaction data with the given hash. Returns false if the
-    /// transaction hash is not indexed.
-    bool ReadTxPos(const uint256& txid, CDiskTxPos& pos) const;
+    /// Write a block of transaction positions to the DB.
+    void WriteTxs(const interfaces::BlockInfo& block);
 
-    /// Write a batch of transaction positions to the DB.
-    bool WriteTxs(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos);
+    /// Used to hash the txid to compute the prefix.
+    const SipHasher13UJ m_hasher;
 
-    /// Migrate txindex data from the block tree DB, where it may be for older nodes that have not
-    /// been upgraded yet to the new database.
-    bool MigrateData(CBlockTreeDB& block_tree_db, const CBlockLocator& best_locator);
+    /// Whether the database contains any legacy ('t' + txid) entries.
+    const bool m_has_legacy;
+
+    CBlockLocator ReadBestBlock() const override;
+    void WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator) override;
+
+private:
+    DB(size_t n_cache_size, bool f_memory, bool f_wipe, bool has_legacy);
 };
 
+static fs::path TxIndexDBPath() { return gArgs.GetDataDirNet() / "indexes" / "txindex"; }
+
 TxIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe) :
-    BaseIndex::DB(GetDataDir() / "indexes" / "txindex", n_cache_size, f_memory, f_wipe)
+    // Bloom filters are built for every key but only consulted by point reads,
+    // which iterators bypass: the per-tx hashed ('x') lookups seek with an
+    // iterator, and the 's'/'h' point reads are at most one per block against a
+    // tiny keyspace. Only the legacy entries' per-tx point lookups benefit, so
+    // enable the filters only for databases still containing them.
+    DB(n_cache_size, f_memory, f_wipe,
+       /*has_legacy=*/!f_memory && !f_wipe && CDBWrapper::HasKeyStartingWith(TxIndexDBPath(), txindex::DB_TXINDEX))
 {}
 
-bool TxIndex::DB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const
+TxIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe, bool has_legacy) :
+    BaseIndex::DB(TxIndexDBPath(), n_cache_size, f_memory, f_wipe, /*f_obfuscate=*/false, /*f_bloom=*/has_legacy),
+    m_hasher{ReadOrCreateTxidHasher(*this)},
+    m_has_legacy{has_legacy}
+{}
+
+CBlockLocator TxIndex::DB::ReadBestBlock() const
 {
-    return Read(std::make_pair(DB_TXINDEX, txid), pos);
-}
-
-bool TxIndex::DB::WriteTxs(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)
-{
-    CDBBatch batch(*this);
-    for (const auto& tuple : v_pos) {
-        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);
-    }
-    return WriteBatch(batch);
-}
-
-/*
- * Safely persist a transfer of data from the old txindex database to the new one, and compact the
- * range of keys updated. This is used internally by MigrateData.
- */
-static void WriteTxIndexMigrationBatches(CDBWrapper& newdb, CDBWrapper& olddb,
-                                         CDBBatch& batch_newdb, CDBBatch& batch_olddb,
-                                         const std::pair<unsigned char, uint256>& begin_key,
-                                         const std::pair<unsigned char, uint256>& end_key)
-{
-    // Sync new DB changes to disk before deleting from old DB.
-    newdb.WriteBatch(batch_newdb, /*fSync=*/ true);
-    olddb.WriteBatch(batch_olddb);
-    olddb.CompactRange(begin_key, end_key);
-
-    batch_newdb.Clear();
-    batch_olddb.Clear();
-}
-
-bool TxIndex::DB::MigrateData(CBlockTreeDB& block_tree_db, const CBlockLocator& best_locator)
-{
-    // The prior implementation of txindex was always in sync with block index
-    // and presence was indicated with a boolean DB flag. If the flag is set,
-    // this means the txindex from a previous version is valid and in sync with
-    // the chain tip. The first step of the migration is to unset the flag and
-    // write the chain hash to a separate key, DB_TXINDEX_BLOCK. After that, the
-    // index entries are copied over in batches to the new database. Finally,
-    // DB_TXINDEX_BLOCK is erased from the old database and the block hash is
-    // written to the new database.
-    //
-    // Unsetting the boolean flag ensures that if the node is downgraded to a
-    // previous version, it will not see a corrupted, partially migrated index
-    // -- it will see that the txindex is disabled. When the node is upgraded
-    // again, the migration will pick up where it left off and sync to the block
-    // with hash DB_TXINDEX_BLOCK.
-    bool f_legacy_flag = false;
-    block_tree_db.ReadFlag("txindex", f_legacy_flag);
-    if (f_legacy_flag) {
-        if (!block_tree_db.Write(DB_TXINDEX_BLOCK, best_locator)) {
-            return error("%s: cannot write block indicator", __func__);
-        }
-        if (!block_tree_db.WriteFlag("txindex", false)) {
-            return error("%s: cannot write block index db flag", __func__);
-        }
-    }
-
     CBlockLocator locator;
-    if (!block_tree_db.Read(DB_TXINDEX_BLOCK, locator)) {
-        return true;
+    if (Read(txindex::DB_BEST_BLOCK_V2, locator)) {
+        return locator;
     }
-
-    int64_t count = 0;
-    LogPrintf("Upgrading txindex database... [0%%]\n");
-    uiInterface.ShowProgress(_("Upgrading txindex database").translated, 0, true);
-    int report_done = 0;
-    const size_t batch_size = 1 << 24; // 16 MiB
-
-    CDBBatch batch_newdb(*this);
-    CDBBatch batch_olddb(block_tree_db);
-
-    std::pair<unsigned char, uint256> key;
-    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};
-    std::pair<unsigned char, uint256> prev_key = begin_key;
-
-    bool interrupted = false;
-    std::unique_ptr<CDBIterator> cursor(block_tree_db.NewIterator());
-    for (cursor->Seek(begin_key); cursor->Valid(); cursor->Next()) {
-        boost::this_thread::interruption_point();
-        if (ShutdownRequested()) {
-            interrupted = true;
-            break;
-        }
-
-        if (!cursor->GetKey(key)) {
-            return error("%s: cannot get key from valid cursor", __func__);
-        }
-        if (key.first != DB_TXINDEX) {
-            break;
-        }
-
-        // Log progress every 10%.
-        if (++count % 256 == 0) {
-            // Since txids are uniformly random and traversed in increasing order, the high 16 bits
-            // of the hash can be used to estimate the current progress.
-            const uint256& txid = key.second;
-            uint32_t high_nibble =
-                (static_cast<uint32_t>(*(txid.begin() + 0)) << 8) +
-                (static_cast<uint32_t>(*(txid.begin() + 1)) << 0);
-            int percentage_done = (int)(high_nibble * 100.0 / 65536.0 + 0.5);
-
-            uiInterface.ShowProgress(_("Upgrading txindex database").translated, percentage_done, true);
-            if (report_done < percentage_done/10) {
-                LogPrintf("Upgrading txindex database... [%d%%]\n", percentage_done);
-                report_done = percentage_done/10;
-            }
-        }
-
-        CDiskTxPos value;
-        if (!cursor->GetValue(value)) {
-            return error("%s: cannot parse txindex record", __func__);
-        }
-        batch_newdb.Write(key, value);
-        batch_olddb.Erase(key);
-
-        if (batch_newdb.SizeEstimate() > batch_size || batch_olddb.SizeEstimate() > batch_size) {
-            // NOTE: it's OK to delete the key pointed at by the current DB cursor while iterating
-            // because LevelDB iterators are guaranteed to provide a consistent view of the
-            // underlying data, like a lightweight snapshot.
-            WriteTxIndexMigrationBatches(*this, block_tree_db,
-                                         batch_newdb, batch_olddb,
-                                         prev_key, key);
-            prev_key = key;
-        }
-    }
-
-    // If these final DB batches complete the migration, write the best block
-    // hash marker to the new database and delete from the old one. This signals
-    // that the former is fully caught up to that point in the blockchain and
-    // that all txindex entries have been removed from the latter.
-    if (!interrupted) {
-        batch_olddb.Erase(DB_TXINDEX_BLOCK);
-        batch_newdb.Write(DB_BEST_BLOCK, locator);
-    }
-
-    WriteTxIndexMigrationBatches(*this, block_tree_db,
-                                 batch_newdb, batch_olddb,
-                                 begin_key, key);
-
-    if (interrupted) {
-        LogPrintf("[CANCELLED].\n");
-        return false;
-    }
-
-    uiInterface.ShowProgress("", 100, false);
-
-    LogPrintf("[DONE].\n");
-    return true;
+    // If we don't have a locator yet, start from the legacy best block.
+    return BaseIndex::DB::ReadBestBlock();
 }
 
-TxIndex::TxIndex(size_t n_cache_size, bool f_memory, bool f_wipe)
-    : m_db(MakeUnique<TxIndex::DB>(n_cache_size, f_memory, f_wipe))
-{}
-
-TxIndex::~TxIndex() {}
-
-bool TxIndex::Init()
+void TxIndex::DB::WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator)
 {
-    LOCK(cs_main);
-
-    // Attempt to migrate txindex from the old database to the new one. Even if
-    // chain_tip is null, the node could be reindexing and we still want to
-    // delete txindex records in the old database.
-    if (!m_db->MigrateData(*pblocktree, ::ChainActive().GetLocator())) {
-        return false;
-    }
-
-    return BaseIndex::Init();
+    batch.Write(txindex::DB_BEST_BLOCK_V2, locator);
 }
 
-bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)
+void TxIndex::DB::WriteTxs(const interfaces::BlockInfo& block)
+{
+    // A block may be submitted again after it was already indexed, e.g. when it
+    // reconnects after a reorg or is re-processed after an unclean shutdown. It
+    // keeps its original sequence number, so skip it to avoid duplicate entries.
+    if (Exists(txindex::BlockHashKey{block.hash})) return;
+
+    uint32_t block_seq{0};
+    Read(txindex::DB_NEXT_BLOCK_SEQ, block_seq);
+
+    CDBBatch batch(*this);
+    batch.Write(txindex::BlockHashKey{block.hash}, block_seq);
+    batch.Write(txindex::BlockSeqKey{block_seq}, block.hash);
+    batch.Write(txindex::DB_NEXT_BLOCK_SEQ, block_seq + 1);
+    uint32_t tx_offset_in_block{txindex::BLOCK_HEADER_SIZE + GetSizeOfCompactSize(block.data->vtx.size())};
+    for (const auto& tx : block.data->vtx) {
+        const txindex::DBKey key{txindex::CreateKeyPrefix(m_hasher, tx->GetHash()),
+                                 txindex::BlockTxPosition{block_seq, tx_offset_in_block}};
+        batch.Write(key, txindex::EMPTY_VALUE);
+        tx_offset_in_block += tx->ComputeTotalSize();
+    }
+    WriteBatch(batch);
+}
+
+TxIndex::TxIndex(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size, bool f_memory, bool f_wipe)
+    : BaseIndex(std::move(chain), "txindex", "txidx"), m_db(std::make_unique<TxIndex::DB>(n_cache_size, f_memory, f_wipe))
+{
+    if (m_db->m_has_legacy) {
+        LogInfo("txindex contains entries in the legacy format, which uses excessive disk space. "
+                "To reclaim disk space, stop the node, delete %s and restart to rebuild the index.",
+                fs::PathToString(TxIndexDBPath()));
+    }
+}
+
+TxIndex::~TxIndex() = default;
+
+bool TxIndex::CustomAppend(const interfaces::BlockInfo& block)
 {
     // Exclude genesis block transaction because outputs are not spendable.
-    if (pindex->nHeight == 0) return true;
+    if (block.height == 0) return true;
 
-    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));
-    std::vector<std::pair<uint256, CDiskTxPos>> vPos;
-    vPos.reserve(block.vtx.size());
-    for (const auto& tx : block.vtx) {
-        vPos.emplace_back(tx->GetHash(), pos);
-        pos.nTxOffset += ::GetSerializeSize(*tx, CLIENT_VERSION);
-    }
-    return m_db->WriteTxs(vPos);
+    assert(block.data);
+    m_db->WriteTxs(block);
+    return true;
 }
 
 BaseIndex::DB& TxIndex::GetDB() const { return *m_db; }
 
-bool TxIndex::FindTx(const uint256& tx_hash, uint256& block_hash, CTransactionRef& tx) const
+template <typename... Args>
+[[noreturn]] static void WarnAndThrowErr(util::ConstevalFormatString<sizeof...(Args)> fmt, const Args&... args)
 {
-    CDiskTxPos postx;
-    if (!m_db->ReadTxPos(tx_hash, postx)) {
-        return false;
+    const std::string err{tfm::format(fmt, args...)};
+    LogWarning("%s", err);
+    throw std::runtime_error{err};
+}
+
+std::optional<TxIndexResult> TxIndex::FindTx(const Txid& tx_hash) const
+{
+    struct Candidate {
+        FlatFilePos tx_position;
+        uint256 block_hash;
+        uint32_t block_seq;
+        //! Whether this candidate's block is currently in the active chain.
+        //! Active chain candidates are attempted first, so duplicate entries
+        //! in both active and stale blocks will always return the active block hash.
+        bool in_active_chain;
+    };
+    std::vector<Candidate> candidates;
+    {
+        std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+        const txindex::TxHashKeyPrefix prefix{txindex::CreateKeyPrefix(m_db->m_hasher, tx_hash)};
+        txindex::DBKey key{prefix, {}};
+        for (it->Seek(key); it->Valid() && it->GetKey(key) && key.hash_prefix == prefix; it->Next()) {
+            uint256 candidate_block_hash;
+            if (!m_db->Read(txindex::BlockSeqKey{key.pos.block_seq}, candidate_block_hash)) {
+                // Read may throw dbwrapper_error.
+                // Read returns false for internal deserialize errors or a
+                // missing key. A missing key can only happen after corruption.
+                WarnAndThrowErr("%s: Corrupt index: block sequence %u not found for txid %s",
+                                GetName(), key.pos.block_seq, tx_hash.ToString());
+            }
+            LOCK(cs_main);
+            const CBlockIndex* block_index{m_chainstate->m_blockman.LookupBlockIndex(candidate_block_hash)};
+            // Stale entries can remain after an unclean shutdown. Unknown blocks
+            // cannot be in the active chain, so skip them.
+            if (!block_index) continue;
+            const bool in_active_chain{m_chainstate->m_chain.Contains(*block_index)};
+            if (!(block_index->nStatus & BLOCK_HAVE_DATA)) {
+                // A stale entry may also refer to a known block without data.
+                // Skip it if it is not in the active chain.
+                if (!in_active_chain) continue;
+                WarnAndThrowErr("%s: Block data %s unexpectedly unavailable for txid %s. Caused by data corruption?",
+                                GetName(), candidate_block_hash.ToString(), tx_hash.ToString());
+            }
+            const FlatFilePos tx_position{block_index->nFile, block_index->nDataPos + key.pos.tx_offset_in_block};
+            candidates.emplace_back(tx_position, candidate_block_hash, key.pos.block_seq, in_active_chain);
+        }
     }
 
-    CAutoFile file(OpenBlockFile(postx, true), SER_DISK, CLIENT_VERSION);
+    // Prefer active-chain matches, then later-connected blocks.
+    std::ranges::sort(candidates, std::greater{}, [](const Candidate& c) { return std::pair{c.in_active_chain, c.block_seq}; });
+
+    for (const auto& candidate : candidates) {
+        AutoFile file{m_chainstate->m_blockman.OpenBlockFile(candidate.tx_position, /*fReadOnly=*/true)};
+        if (file.IsNull()) {
+            WarnAndThrowErr("%s: Failed to open block file for txid %s at %s in block %s",
+                            GetName(), tx_hash.ToString(), candidate.tx_position.ToString(), candidate.block_hash.ToString());
+        }
+        CTransactionRef tx;
+        try {
+            file >> TX_WITH_WITNESS(tx);
+        } catch (const std::exception& e) {
+            WarnAndThrowErr("%s: Deserialize or I/O error (%s). txid %s at %s in block %s",
+                            GetName(), e.what(), tx_hash.ToString(), candidate.tx_position.ToString(), candidate.block_hash.ToString());
+        }
+        if (tx->GetHash() == tx_hash) {
+            return TxIndexResult{candidate.block_hash, std::move(tx)};
+        }
+    }
+    // Fall back to legacy if no hashed entry matched. This makes misses pay an
+    // extra lookup, but keeps existing full-txid entries readable after upgrade.
+    return m_db->m_has_legacy ? FindLegacyTx(tx_hash) : std::nullopt;
+}
+
+std::optional<TxIndexResult> TxIndex::FindLegacyTx(const Txid& tx_hash) const
+{
+    CDiskTxPos postx;
+    const auto read{m_db->TryRead(txindex::LegacyTxKey(tx_hash), postx)};
+    if (!read) {
+        WarnAndThrowErr("%s: Failed to read legacy entry for txid %s: %s",
+                        GetName(), tx_hash.ToString(), read.error().err_msg);
+    }
+    if (!read.value()) {
+        return std::nullopt;
+    }
+
+    AutoFile file{m_chainstate->m_blockman.OpenBlockFile(postx, /*fReadOnly=*/true)};
     if (file.IsNull()) {
-        return error("%s: OpenBlockFile failed", __func__);
+        WarnAndThrowErr("%s: Failed to open block file for txid %s at %s",
+                        GetName(), tx_hash.ToString(), postx.ToString());
     }
     CBlockHeader header;
+    CTransactionRef tx;
     try {
         file >> header;
-        if (fseek(file.Get(), postx.nTxOffset, SEEK_CUR)) {
-            return error("%s: fseek(...) failed", __func__);
-        }
-        file >> tx;
+        file.seek(postx.nTxOffset, SEEK_CUR);
+        file >> TX_WITH_WITNESS(tx);
     } catch (const std::exception& e) {
-        return error("%s: Deserialize or I/O error - %s", __func__, e.what());
+        WarnAndThrowErr("%s: Deserialize or I/O error (%s). txid %s at %s",
+                        GetName(), e.what(), tx_hash.ToString(), postx.ToString());
     }
     if (tx->GetHash() != tx_hash) {
-        return error("%s: txid mismatch", __func__);
+        WarnAndThrowErr("%s: txid mismatch in legacy index. txid %s at %s",
+                        GetName(), tx_hash.ToString(), postx.ToString());
     }
-    block_hash = header.GetHash();
-    return true;
+    return TxIndexResult{header.GetHash(), std::move(tx)};
 }

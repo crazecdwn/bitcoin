@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020 The Bitcoin Core developers
+// Copyright (c) 2019-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -11,39 +11,39 @@
 #include <pubkey.h>
 #include <streams.h>
 #include <test/fuzz/fuzz.h>
+#include <util/chaintype.h>
 #include <validation.h>
-#include <version.h>
 
 #include <cassert>
 #include <string>
 
-void initialize()
+void initialize_block()
 {
-    static const ECCVerifyHandle verify_handle;
-    SelectParams(CBaseChainParams::REGTEST);
+    SelectParams(ChainType::REGTEST);
 }
 
-void test_one_input(const std::vector<uint8_t>& buffer)
+FUZZ_TARGET(block, .init = initialize_block)
 {
-    CDataStream ds(buffer, SER_NETWORK, INIT_PROTO_VERSION);
     CBlock block;
     try {
-        int nVersion;
-        ds >> nVersion;
-        ds.SetVersion(nVersion);
-        ds >> block;
+        SpanReader{buffer} >> TX_WITH_WITNESS(block);
     } catch (const std::ios_base::failure&) {
         return;
     }
     const Consensus::Params& consensus_params = Params().GetConsensus();
     BlockValidationState validation_state_pow_and_merkle;
     const bool valid_incl_pow_and_merkle = CheckBlock(block, validation_state_pow_and_merkle, consensus_params, /* fCheckPOW= */ true, /* fCheckMerkleRoot= */ true);
+    assert(validation_state_pow_and_merkle.IsValid() || validation_state_pow_and_merkle.IsInvalid() || validation_state_pow_and_merkle.IsError());
+    (void)validation_state_pow_and_merkle.Error("");
     BlockValidationState validation_state_pow;
     const bool valid_incl_pow = CheckBlock(block, validation_state_pow, consensus_params, /* fCheckPOW= */ true, /* fCheckMerkleRoot= */ false);
+    assert(validation_state_pow.IsValid() || validation_state_pow.IsInvalid() || validation_state_pow.IsError());
     BlockValidationState validation_state_merkle;
     const bool valid_incl_merkle = CheckBlock(block, validation_state_merkle, consensus_params, /* fCheckPOW= */ false, /* fCheckMerkleRoot= */ true);
+    assert(validation_state_merkle.IsValid() || validation_state_merkle.IsInvalid() || validation_state_merkle.IsError());
     BlockValidationState validation_state_none;
     const bool valid_incl_none = CheckBlock(block, validation_state_none, consensus_params, /* fCheckPOW= */ false, /* fCheckMerkleRoot= */ false);
+    assert(validation_state_none.IsValid() || validation_state_none.IsInvalid() || validation_state_none.IsError());
     if (valid_incl_pow_and_merkle) {
         assert(valid_incl_pow && valid_incl_merkle && valid_incl_none);
     } else if (valid_incl_merkle || valid_incl_pow) {
@@ -53,8 +53,6 @@ void test_one_input(const std::vector<uint8_t>& buffer)
     (void)block.ToString();
     (void)BlockMerkleRoot(block);
     if (!block.vtx.empty()) {
-        // TODO: Avoid array index out of bounds error in BlockWitnessMerkleRoot
-        //       when block.vtx.empty().
         (void)BlockWitnessMerkleRoot(block);
     }
     (void)GetBlockWeight(block);

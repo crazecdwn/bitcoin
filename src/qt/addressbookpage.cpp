@@ -1,10 +1,6 @@
-// Copyright (c) 2011-2019 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
 
 #include <qt/addressbookpage.h>
 #include <qt/forms/ui_addressbookpage.h>
@@ -19,6 +15,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QSortFilterProxyModel>
+#include <QRegularExpression>
 
 class AddressBookSortFilterProxyModel final : public QSortFilterProxyModel
 {
@@ -35,7 +32,7 @@ public:
     }
 
 protected:
-    bool filterAcceptsRow(int row, const QModelIndex& parent) const
+    bool filterAcceptsRow(int row, const QModelIndex& parent) const override
     {
         auto model = sourceModel();
         auto label = model->index(row, AddressTableModel::Label, parent);
@@ -46,19 +43,15 @@ protected:
 
         auto address = model->index(row, AddressTableModel::Address, parent);
 
-        if (filterRegExp().indexIn(model->data(address).toString()) < 0 &&
-            filterRegExp().indexIn(model->data(label).toString()) < 0) {
-            return false;
-        }
-
-        return true;
+        const auto pattern = filterRegularExpression();
+        return (model->data(address).toString().contains(pattern) ||
+                model->data(label).toString().contains(pattern));
     }
 };
 
 AddressBookPage::AddressBookPage(const PlatformStyle *platformStyle, Mode _mode, Tabs _tab, QWidget *parent) :
-    QDialog(parent),
+    QDialog(parent, GUIUtil::dialog_flags),
     ui(new Ui::AddressBookPage),
-    model(nullptr),
     mode(_mode),
     tab(_tab)
 {
@@ -76,9 +69,7 @@ AddressBookPage::AddressBookPage(const PlatformStyle *platformStyle, Mode _mode,
         ui->exportButton->setIcon(platformStyle->SingleColorIcon(":/icons/export"));
     }
 
-    switch(mode)
-    {
-    case ForSelection:
+    if (mode == ForSelection) {
         switch(tab)
         {
         case SendingTab: setWindowTitle(tr("Choose the address to send coins to")); break;
@@ -89,14 +80,6 @@ AddressBookPage::AddressBookPage(const PlatformStyle *platformStyle, Mode _mode,
         ui->tableView->setFocus();
         ui->closeButton->setText(tr("C&hoose"));
         ui->exportButton->hide();
-        break;
-    case ForEditing:
-        switch(tab)
-        {
-        case SendingTab: setWindowTitle(tr("Sending addresses")); break;
-        case ReceivingTab: setWindowTitle(tr("Receiving addresses")); break;
-        }
-        break;
     }
     switch(tab)
     {
@@ -106,35 +89,23 @@ AddressBookPage::AddressBookPage(const PlatformStyle *platformStyle, Mode _mode,
         ui->newAddress->setVisible(true);
         break;
     case ReceivingTab:
-        ui->labelExplanation->setText(tr("These are your Bitcoin addresses for receiving payments. Use the 'Create new receiving address' button in the receive tab to create new addresses."));
+        ui->labelExplanation->setText(tr("These are your Bitcoin addresses for receiving payments. Use the 'Create new receiving address' button in the receive tab to create new addresses.\nSigning is only possible with addresses of the type 'legacy'."));
         ui->deleteAddress->setVisible(false);
         ui->newAddress->setVisible(false);
         break;
     }
 
-    // Context menu actions
-    QAction *copyAddressAction = new QAction(tr("&Copy Address"), this);
-    QAction *copyLabelAction = new QAction(tr("Copy &Label"), this);
-    QAction *editAction = new QAction(tr("&Edit"), this);
-    deleteAction = new QAction(ui->deleteAddress->text(), this);
-
     // Build context menu
     contextMenu = new QMenu(this);
-    contextMenu->addAction(copyAddressAction);
-    contextMenu->addAction(copyLabelAction);
-    contextMenu->addAction(editAction);
-    if(tab == SendingTab)
-        contextMenu->addAction(deleteAction);
-    contextMenu->addSeparator();
+    contextMenu->addAction(tr("&Copy Address"), this, &AddressBookPage::on_copyAddress_clicked);
+    contextMenu->addAction(tr("Copy &Label"), this, &AddressBookPage::onCopyLabelAction);
+    contextMenu->addAction(tr("&Edit"), this, &AddressBookPage::onEditAction);
 
-    // Connect signals for context menu actions
-    connect(copyAddressAction, &QAction::triggered, this, &AddressBookPage::on_copyAddress_clicked);
-    connect(copyLabelAction, &QAction::triggered, this, &AddressBookPage::onCopyLabelAction);
-    connect(editAction, &QAction::triggered, this, &AddressBookPage::onEditAction);
-    connect(deleteAction, &QAction::triggered, this, &AddressBookPage::on_deleteAddress_clicked);
+    if (tab == SendingTab) {
+        contextMenu->addAction(tr("&Delete"), this, &AddressBookPage::on_deleteAddress_clicked);
+    }
 
     connect(ui->tableView, &QWidget::customContextMenuRequested, this, &AddressBookPage::contextualMenu);
-
     connect(ui->closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
     GUIUtil::handleCloseWindowShortcut(this);
@@ -171,6 +142,7 @@ void AddressBookPage::setModel(AddressTableModel *_model)
     connect(_model, &AddressTableModel::rowsInserted, this, &AddressBookPage::selectNewAddress);
 
     selectionChanged();
+    this->updateWindowsTitleWithWalletName();
 }
 
 void AddressBookPage::on_copyAddress_clicked()
@@ -194,14 +166,14 @@ void AddressBookPage::onEditAction()
     if(indexes.isEmpty())
         return;
 
-    EditAddressDialog dlg(
+    auto dlg = new EditAddressDialog(
         tab == SendingTab ?
         EditAddressDialog::EditSendingAddress :
         EditAddressDialog::EditReceivingAddress, this);
-    dlg.setModel(model);
+    dlg->setModel(model);
     QModelIndex origIndex = proxyModel->mapToSource(indexes.at(0));
-    dlg.loadRow(origIndex.row());
-    dlg.exec();
+    dlg->loadRow(origIndex.row());
+    GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 
 void AddressBookPage::on_newAddress_clicked()
@@ -249,13 +221,11 @@ void AddressBookPage::selectionChanged()
             // In sending tab, allow deletion of selection
             ui->deleteAddress->setEnabled(true);
             ui->deleteAddress->setVisible(true);
-            deleteAction->setEnabled(true);
             break;
         case ReceivingTab:
             // Deleting receiving addresses, however, is not allowed
             ui->deleteAddress->setEnabled(false);
             ui->deleteAddress->setVisible(false);
-            deleteAction->setEnabled(false);
             break;
         }
         ui->copyAddress->setEnabled(true);
@@ -295,7 +265,9 @@ void AddressBookPage::on_exportButton_clicked()
     // CSV is currently the only supported format
     QString filename = GUIUtil::getSaveFileName(this,
         tr("Export Address List"), QString(),
-        tr("Comma separated file (*.csv)"), nullptr);
+        /*: Expanded name of the CSV file format.
+            See: https://en.wikipedia.org/wiki/Comma-separated_values. */
+        tr("Comma separated file") + QLatin1String(" (*.csv)"), nullptr);
 
     if (filename.isNull())
         return;
@@ -309,6 +281,8 @@ void AddressBookPage::on_exportButton_clicked()
 
     if(!writer.write()) {
         QMessageBox::critical(this, tr("Exporting Failed"),
+            /*: An error message. %1 is a stand-in argument for the name
+                of the file we attempted to save to. */
             tr("There was an error trying to save the address list to %1. Please try again.").arg(filename));
     }
 }
@@ -331,5 +305,18 @@ void AddressBookPage::selectNewAddress(const QModelIndex &parent, int begin, int
         ui->tableView->setFocus();
         ui->tableView->selectRow(idx.row());
         newAddressToSelect.clear();
+    }
+}
+
+void AddressBookPage::updateWindowsTitleWithWalletName()
+{
+    const QString walletName = this->model->GetWalletDisplayName();
+
+    if (mode == ForEditing) {
+        switch(tab)
+        {
+        case SendingTab: setWindowTitle(tr("Sending addresses - %1").arg(walletName)); break;
+        case ReceivingTab: setWindowTitle(tr("Receiving addresses - %1").arg(walletName)); break;
+        }
     }
 }

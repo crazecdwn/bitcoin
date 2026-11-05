@@ -1,10 +1,13 @@
-// Copyright (c) 2014-2018 The Bitcoin Core developers
+// Copyright (c) 2014-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <crypto/hmac_sha512.h>
 
-#include <string.h>
+#include <crypto/sha512.h>
+#include <support/cleanse.h>
+
+#include <cstring>
 
 CHMAC_SHA512::CHMAC_SHA512(const unsigned char* key, size_t keylen)
 {
@@ -24,6 +27,8 @@ CHMAC_SHA512::CHMAC_SHA512(const unsigned char* key, size_t keylen)
     for (int n = 0; n < 128; n++)
         rkey[n] ^= 0x5c ^ 0x36;
     inner.Write(rkey, 128);
+
+    memory_cleanse(rkey, sizeof(rkey));
 }
 
 void CHMAC_SHA512::Finalize(unsigned char hash[OUTPUT_SIZE])
@@ -31,4 +36,5 @@ void CHMAC_SHA512::Finalize(unsigned char hash[OUTPUT_SIZE])
     unsigned char temp[64];
     inner.Finalize(temp);
     outer.Write(temp, 64).Finalize(hash);
+    memory_cleanse(temp, sizeof(temp));
 }

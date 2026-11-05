@@ -1,14 +1,36 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2019-2020 The Bitcoin Core developers
+# Copyright (c) 2019-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 export LC_ALL=C.UTF-8
 
-export CONTAINER_NAME=ci_native_asan
-export PACKAGES="clang-8 llvm-8 python3-zmq qtbase5-dev qttools5-dev-tools libevent-dev bsdmainutils libboost-system-dev libboost-filesystem-dev libboost-test-dev libboost-thread-dev libdb5.3++-dev libminiupnpc-dev libzmq3-dev libqrencode-dev"
-# Use clang-8 instead of default clang (which is clang-6 on Bionic) to avoid spurious segfaults when running on ppc64le
+export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+
+# Only install BCC tracing packages in CI. Container has to match the host for BCC to work.
+if [[ "${INSTALL_BCC_TRACING_TOOLS:-}" == "true" ]]; then
+  # Required for USDT functional tests to run
+  BPFCC_PACKAGE="bpfcc-tools linux-headers-$(uname --kernel-release)"
+  export CI_CONTAINER_CAP="--privileged -v /sys/kernel:/sys/kernel:rw"
+else
+  BPFCC_PACKAGE=""
+  export CI_CONTAINER_CAP="--cap-add SYS_PTRACE"  # If run with (ASan + LSan), the container needs access to ptrace (https://github.com/google/sanitizers/issues/764)
+fi
+
+export APT_LLVM_V="23"
+export PACKAGES="systemtap-sdt-dev clang-${APT_LLVM_V} llvm-${APT_LLVM_V} libclang-rt-${APT_LLVM_V}-dev mold python3-zmq qt6-base-dev qt6-tools-dev qt6-l10n-tools libboost-dev libzmq3-dev libqrencode-dev libsqlite3-dev ${BPFCC_PACKAGE} libcapnp-dev capnproto python3-pip"
+export PIP_PACKAGES="--break-system-packages pycapnp"
 export NO_DEPENDS=1
-export GOAL="install"
-export BITCOIN_CONFIG="--enable-zmq --with-incompatible-bdb --with-gui=qt5 CPPFLAGS='-DARENA_DEBUG -DDEBUG_LOCKORDER' --with-sanitizers=address,integer,undefined CC=clang-8 CXX=clang++-8"
+export CI_LIMIT_STACK_SIZE=1
+printf -v BITCOIN_CONFIG "%q " \
+ --preset=dev-mode \
+ -DSANITIZERS=address,float-divide-by-zero,integer,undefined \
+ -DCMAKE_C_COMPILER=clang \
+ -DCMAKE_CXX_COMPILER=clang++ \
+ -DCMAKE_C_FLAGS=-ftrivial-auto-var-init=pattern \
+ -DCMAKE_CXX_FLAGS=-ftrivial-auto-var-init=pattern \
+ -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold \
+ -DAPPEND_CXXFLAGS=-std=c++23  `# Use the next std version to catch deprecated code early` \
+ -DAPPEND_CPPFLAGS="-DARENA_DEBUG -DDEBUG_LOCKORDER"
+export BITCOIN_CONFIG

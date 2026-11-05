@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2020 The Bitcoin Core developers
+// Copyright (c) 2018-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,17 +6,25 @@
 
 #include <rpc/server.h>
 #include <rpc/util.h>
+#include <univalue.h>
 #include <zmq/zmqabstractnotifier.h>
 #include <zmq/zmqnotificationinterface.h>
 
-#include <univalue.h>
+#include <list>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+class JSONRPCRequest;
 
 namespace {
 
-UniValue getzmqnotifications(const JSONRPCRequest& request)
+static RPCMethod getzmqnotifications()
 {
-            RPCHelpMan{"getzmqnotifications",
-                "\nReturns information about the active ZeroMQ notifications.\n",
+    return RPCMethod{
+        "getzmqnotifications",
+        "Returns information about the active ZeroMQ notifications.\n",
                 {},
                 RPCResult{
                     RPCResult::Type::ARR, "", "",
@@ -33,8 +41,8 @@ UniValue getzmqnotifications(const JSONRPCRequest& request)
                     HelpExampleCli("getzmqnotifications", "")
             + HelpExampleRpc("getzmqnotifications", "")
                 },
-            }.Check(request);
-
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
     UniValue result(UniValue::VARR);
     if (g_zmq_notification_interface != nullptr) {
         for (const auto* n : g_zmq_notification_interface->GetActiveNotifiers()) {
@@ -42,17 +50,17 @@ UniValue getzmqnotifications(const JSONRPCRequest& request)
             obj.pushKV("type", n->GetType());
             obj.pushKV("address", n->GetAddress());
             obj.pushKV("hwm", n->GetOutboundMessageHighWaterMark());
-            result.push_back(obj);
+            result.push_back(std::move(obj));
         }
     }
 
     return result;
+},
+    };
 }
 
-const CRPCCommand commands[] =
-{ //  category              name                                actor (function)                argNames
-  //  -----------------     ------------------------            -----------------------         ----------
-    { "zmq",                "getzmqnotifications",              &getzmqnotifications,           {} },
+const CRPCCommand commands[]{
+    {"zmq", &getzmqnotifications},
 };
 
 } // anonymous namespace

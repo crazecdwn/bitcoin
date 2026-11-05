@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2020 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,18 +10,20 @@
 #include <qt/platformstyle.h>
 #include <qt/walletmodel.h>
 
+#include <common/signmessage.h>
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <key_io.h>
-#include <util/message.h> // For MessageSign(), MessageVerify()
 #include <wallet/wallet.h>
 
+#include <string>
+#include <variant>
 #include <vector>
 
 #include <QClipboard>
 
 SignVerifyMessageDialog::SignVerifyMessageDialog(const PlatformStyle *_platformStyle, QWidget *parent) :
-    QDialog(parent),
+    QDialog(parent, GUIUtil::dialog_flags),
     ui(new Ui::SignVerifyMessageDialog),
-    model(nullptr),
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
@@ -91,6 +93,7 @@ void SignVerifyMessageDialog::on_addressBookButton_SM_clicked()
 {
     if (model && model->getAddressTableModel())
     {
+        model->refresh(/*pk_hash_only=*/true);
         AddressBookPage dlg(platformStyle, AddressBookPage::ForSelection, AddressBookPage::ReceivingTab, this);
         dlg.setModel(model->getAddressTableModel());
         if (dlg.exec())
@@ -119,11 +122,11 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         ui->statusLabel_SM->setText(tr("The entered address is invalid.") + QString(" ") + tr("Please check the address and try again."));
         return;
     }
-    const PKHash* pkhash = boost::get<PKHash>(&destination);
+    const PKHash* pkhash = std::get_if<PKHash>(&destination);
     if (!pkhash) {
         ui->addressIn_SM->setValid(false);
         ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
-        ui->statusLabel_SM->setText(tr("The entered address does not refer to a key.") + QString(" ") + tr("Please check the address and try again."));
+        ui->statusLabel_SM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Message signing for SegWit and other non-P2PKH address types is not supported in this version of %1. Please check the address and try again.").arg(CLIENT_NAME));
         return;
     }
 
@@ -150,8 +153,7 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         case SigningResult::SIGNING_FAILED:
             error = tr("Message signing failed.");
             break;
-        // no default case, so the compiler can warn about missing cases
-    }
+    } // no default case, so the compiler can warn about missing cases
 
     if (res != SigningResult::OK) {
         ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
@@ -221,10 +223,7 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
         return;
     case MessageVerificationResult::ERR_ADDRESS_NO_KEY:
         ui->addressIn_VM->setValid(false);
-        ui->statusLabel_VM->setText(
-            tr("The entered address does not refer to a key.") + QString(" ") +
-            tr("Please check the address and try again.")
-        );
+        ui->statusLabel_VM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Message signing for SegWit and other non-P2PKH address types is not supported in this version of %1. Please check the address and try again.").arg(CLIENT_NAME));
         return;
     case MessageVerificationResult::ERR_MALFORMED_SIGNATURE:
         ui->signatureIn_VM->setValid(false);
@@ -281,4 +280,20 @@ bool SignVerifyMessageDialog::eventFilter(QObject *object, QEvent *event)
         }
     }
     return QDialog::eventFilter(object, event);
+}
+
+void SignVerifyMessageDialog::changeEvent(QEvent* e)
+{
+    if (e->type() == QEvent::PaletteChange) {
+        ui->addressBookButton_SM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/address-book")));
+        ui->pasteButton_SM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/editpaste")));
+        ui->copySignatureButton_SM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/editcopy")));
+        ui->signMessageButton_SM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/edit")));
+        ui->clearButton_SM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/remove")));
+        ui->addressBookButton_VM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/address-book")));
+        ui->verifyMessageButton_VM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/transaction_0")));
+        ui->clearButton_VM->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/remove")));
+    }
+
+    QDialog::changeEvent(e);
 }

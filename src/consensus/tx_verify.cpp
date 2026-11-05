@@ -1,18 +1,24 @@
-// Copyright (c) 2017-2019 The Bitcoin Core developers
+// Copyright (c) 2017-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/tx_verify.h>
 
-#include <consensus/consensus.h>
-#include <primitives/transaction.h>
-#include <script/interpreter.h>
-#include <consensus/validation.h>
-
-// TODO remove the following dependencies
 #include <chain.h>
 #include <coins.h>
+#include <consensus/amount.h>
+#include <consensus/consensus.h>
+#include <consensus/validation.h>
+#include <primitives/transaction.h>
+#include <script/interpreter.h>
+#include <script/script.h>
+#include <tinyformat.h>
+#include <util/check.h>
 #include <util/moneystr.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <string>
 
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
@@ -20,6 +26,15 @@ bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
         return true;
     if ((int64_t)tx.nLockTime < ((int64_t)tx.nLockTime < LOCKTIME_THRESHOLD ? (int64_t)nBlockHeight : nBlockTime))
         return true;
+
+    // Even if tx.nLockTime isn't satisfied by nBlockHeight/nBlockTime, a
+    // transaction is still considered final if all inputs' nSequence ==
+    // SEQUENCE_FINAL (0xffffffff), in which case nLockTime is ignored.
+    //
+    // Because of this behavior OP_CHECKLOCKTIMEVERIFY/CheckLockTime() will
+    // also check that the spending input's nSequence != SEQUENCE_FINAL,
+    // ensuring that an unsatisfied nLockTime value will actually cause
+    // IsFinalTx() to return false here:
     for (const auto& txin : tx.vin) {
         if (!(txin.nSequence == CTxIn::SEQUENCE_FINAL))
             return false;
@@ -27,9 +42,9 @@ bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
     return true;
 }
 
-std::pair<int, int64_t> CalculateSequenceLocks(const CTransaction &tx, int flags, std::vector<int>* prevHeights, const CBlockIndex& block)
+std::pair<int, int64_t> CalculateSequenceLocks(const CTransaction &tx, int flags, std::vector<int>& prevHeights, const CBlockIndex& block)
 {
-    assert(prevHeights->size() == tx.vin.size());
+    assert(prevHeights.size() == tx.vin.size());
 
     // Will be set to the equivalent height- and time-based nLockTime
     // values that would be necessary to satisfy all relative lock-
@@ -39,11 +54,7 @@ std::pair<int, int64_t> CalculateSequenceLocks(const CTransaction &tx, int flags
     int nMinHeight = -1;
     int64_t nMinTime = -1;
 
-    // tx.nVersion is signed integer so requires cast to unsigned otherwise
-    // we would be doing a signed comparison and half the range of nVersion
-    // wouldn't support BIP 68.
-    bool fEnforceBIP68 = static_cast<uint32_t>(tx.nVersion) >= 2
-                      && flags & LOCKTIME_VERIFY_SEQUENCE;
+    bool fEnforceBIP68 = tx.version >= 2 && flags & LOCKTIME_VERIFY_SEQUENCE;
 
     // Do not enforce sequence numbers as a relative lock time
     // unless we have been instructed to
@@ -59,14 +70,14 @@ std::pair<int, int64_t> CalculateSequenceLocks(const CTransaction &tx, int flags
         // consensus-enforced meaning at this point.
         if (txin.nSequence & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG) {
             // The height of this input is not relevant for sequence locks
-            (*prevHeights)[txinIndex] = 0;
+            prevHeights[txinIndex] = 0;
             continue;
         }
 
-        int nCoinHeight = (*prevHeights)[txinIndex];
+        int nCoinHeight = prevHeights[txinIndex];
 
         if (txin.nSequence & CTxIn::SEQUENCE_LOCKTIME_TYPE_FLAG) {
-            int64_t nCoinTime = block.GetAncestor(std::max(nCoinHeight-1, 0))->GetMedianTimePast();
+            const int64_t nCoinTime{Assert(block.GetAncestor(std::max(nCoinHeight - 1, 0)))->GetMedianTimePast()};
             // NOTE: Subtract 1 to maintain nLockTime semantics
             // BIP 68 relative lock times have the semantics of calculating
             // the first block or time at which the transaction would be
@@ -99,7 +110,7 @@ bool EvaluateSequenceLocks(const CBlockIndex& block, std::pair<int, int64_t> loc
     return true;
 }
 
-bool SequenceLocks(const CTransaction &tx, int flags, std::vector<int>* prevHeights, const CBlockIndex& block)
+bool SequenceLocks(const CTransaction &tx, int flags, std::vector<int>& prevHeights, const CBlockIndex& block)
 {
     return EvaluateSequenceLocks(block, CalculateSequenceLocks(tx, flags, prevHeights, block));
 }
@@ -135,7 +146,7 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
     return nSigOps;
 }
 
-int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, int flags)
+int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, script_verify_flags flags)
 {
     int64_t nSigOps = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
 
@@ -151,7 +162,7 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
         const Coin& coin = inputs.AccessCoin(tx.vin[i].prevout);
         assert(!coin.IsSpent());
         const CTxOut &prevout = coin.out;
-        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey, &tx.vin[i].scriptWitness, flags);
+        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey, tx.vin[i].scriptWitness, flags);
     }
     return nSigOps;
 }
@@ -183,6 +194,10 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         }
     }
 
+    // `tx.GetValueOut()` won't throw in validation paths because output-range checks run first
+    // (`bad-txns-vout-negative`, `bad-txns-vout-toolarge`, `bad-txns-txouttotal-toolarge`):
+    // * `MemPoolAccept::PreChecks`: `CheckTransaction()` is called before this method;
+    // * `Chainstate::ConnectBlock`: `CheckTransaction()` is called via `CheckBlock()` before this method.
     const CAmount value_out = tx.GetValueOut();
     if (nValueIn < value_out) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
@@ -192,6 +207,11 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     // Tally transaction fees
     const CAmount txfee_aux = nValueIn - value_out;
     if (!MoneyRange(txfee_aux)) {
+        // Unreachable, given the following preconditions:
+        // * `value_out` comes from `tx.GetValueOut()`, which throws unless `MoneyRange(value_out)` and asserts `MoneyRange(nValueOut)` on return.
+        // * `MoneyRange(nValueIn)` was enforced in the input loop.
+        // * `nValueIn < value_out` was handled above, so `nValueIn >= value_out` here (and `txfee_aux >= 0`).
+        // Therefore `0 <= txfee_aux = nValueIn - value_out <= nValueIn <= MAX_MONEY`.
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-outofrange");
     }
 

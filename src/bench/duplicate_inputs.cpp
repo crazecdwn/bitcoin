@@ -1,26 +1,34 @@
-// Copyright (c) 2011-2020 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
+#include <chain.h>
 #include <chainparams.h>
+#include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <pow.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <random.h>
+#include <script/script.h>
+#include <sync.h>
 #include <test/util/setup_common.h>
-#include <txmempool.h>
+#include <uint256.h>
+#include <util/check.h>
 #include <validation.h>
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-static void DuplicateInputs(benchmark::State& state)
+
+static void DuplicateInputs(benchmark::Bench& bench)
 {
-    TestingSetup test_setup{
-        CBaseChainParams::REGTEST,
-        /* extra_args */ {
-            "-nodebuglogfile",
-            "-nodebug",
-        },
-    };
+    const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
 
     const CScript SCRIPT_PUB{CScript(OP_TRUE)};
 
@@ -31,7 +39,7 @@ static void DuplicateInputs(benchmark::State& state)
     CMutableTransaction naughtyTx{};
 
     LOCK(cs_main);
-    CBlockIndex* pindexPrev = ::ChainActive().Tip();
+    CBlockIndex* pindexPrev = testing_setup->m_node.chainman->ActiveChain().Tip();
     assert(pindexPrev != nullptr);
     block.nBits = GetNextWorkRequired(pindexPrev, &block, chainparams.GetConsensus());
     block.nNonce = 0;
@@ -50,9 +58,9 @@ static void DuplicateInputs(benchmark::State& state)
     naughtyTx.vout[0].nValue = 0;
     naughtyTx.vout[0].scriptPubKey = SCRIPT_PUB;
 
-    uint64_t n_inputs = (((MAX_BLOCK_SERIALIZED_SIZE / WITNESS_SCALE_FACTOR) - (CTransaction(coinbaseTx).GetTotalSize() + CTransaction(naughtyTx).GetTotalSize())) / 41) - 100;
+    uint64_t n_inputs = (((MAX_BLOCK_SERIALIZED_SIZE / WITNESS_SCALE_FACTOR) - (CTransaction(coinbaseTx).ComputeTotalSize() + CTransaction(naughtyTx).ComputeTotalSize())) / 41) - 100;
     for (uint64_t x = 0; x < (n_inputs - 1); ++x) {
-        naughtyTx.vin.emplace_back(GetRandHash(), 0, CScript(), 0);
+        naughtyTx.vin.emplace_back(Txid::FromUint256(GetRandHash()), 0, CScript(), 0);
     }
     naughtyTx.vin.emplace_back(naughtyTx.vin.back());
 
@@ -61,11 +69,11 @@ static void DuplicateInputs(benchmark::State& state)
 
     block.hashMerkleRoot = BlockMerkleRoot(block);
 
-    while (state.KeepRunning()) {
+    bench.run([&] {
         BlockValidationState cvstate{};
         assert(!CheckBlock(block, cvstate, chainparams.GetConsensus(), false, false));
         assert(cvstate.GetRejectReason() == "bad-txns-inputs-duplicate");
-    }
+    });
 }
 
-BENCHMARK(DuplicateInputs, 10);
+BENCHMARK(DuplicateInputs);

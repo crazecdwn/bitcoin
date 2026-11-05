@@ -1,52 +1,54 @@
-// Copyright (c) 2016-2020 The Bitcoin Core developers
+// Copyright (c) 2016-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
-#include <bench/data.h>
-
-#include <chainparams.h>
+#include <bench/data/block413567.raw.h>
 #include <consensus/validation.h>
+#include <kernel/chainparams.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <serialize.h>
 #include <streams.h>
+#include <util/check.h>
 #include <validation.h>
+
+#include <memory>
+#include <span>
+#include <vector>
 
 // These are the two major time-sinks which happen after we have fully received
 // a block off the wire, but before we can relay the block on to peers using
 // compact block relay.
 
-static void DeserializeBlockTest(benchmark::State& state)
+static void DeserializeBlockTest(benchmark::Bench& bench)
 {
-    CDataStream stream(benchmark::data::block413567, SER_NETWORK, PROTOCOL_VERSION);
-    char a = '\0';
-    stream.write(&a, 1); // Prevent compaction
-
-    while (state.KeepRunning()) {
+    const auto block_data{benchmark::data::block413567};
+    bench.unit("block").run([&] {
         CBlock block;
-        stream >> block;
-        bool rewound = stream.Rewind(benchmark::data::block413567.size());
-        assert(rewound);
-    }
+        SpanReader{block_data} >> TX_WITH_WITNESS(block);
+        assert(block.vtx.size() == 1557);
+    });
 }
 
-static void DeserializeAndCheckBlockTest(benchmark::State& state)
+static void CheckBlockTest(benchmark::Bench& bench)
 {
-    CDataStream stream(benchmark::data::block413567, SER_NETWORK, PROTOCOL_VERSION);
-    char a = '\0';
-    stream.write(&a, 1); // Prevent compaction
+    const auto& chain_params{CChainParams::Main()};
+    const auto block_data{benchmark::data::block413567};
 
-    const auto chainParams = CreateChainParams(CBaseChainParams::MAIN);
-
-    while (state.KeepRunning()) {
-        CBlock block; // Note that CBlock caches its checked state, so we need to recreate it here
-        stream >> block;
-        bool rewound = stream.Rewind(benchmark::data::block413567.size());
-        assert(rewound);
-
-        BlockValidationState validationState;
-        bool checked = CheckBlock(block, validationState, chainParams->GetConsensus());
-        assert(checked);
-    }
+    CBlock block;
+    bench.unit("block")
+        .setup([&] {
+            block = CBlock{};
+            SpanReader{block_data} >> TX_WITH_WITNESS(block);
+            assert(block.vtx.size() == 1557);
+        })
+        .run([&] {
+            BlockValidationState validationState;
+            const bool checked{CheckBlock(block, validationState, chain_params->GetConsensus())};
+            assert(checked);
+        });
 }
 
-BENCHMARK(DeserializeBlockTest, 130);
-BENCHMARK(DeserializeAndCheckBlockTest, 160);
+BENCHMARK(DeserializeBlockTest);
+BENCHMARK(CheckBlockTest);

@@ -1,13 +1,22 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2019 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <script/script.h>
 
-#include <util/strencodings.h>
+#include <crypto/common.h>
+#include <crypto/hex_base.h>
+#include <hash.h>
+#include <uint256.h>
+#include <util/hash_type.h>
 
-const char* GetOpName(opcodetype opcode)
+#include <compare>
+#include <string>
+
+CScriptID::CScriptID(const CScript& in) : BaseHash(Hash160(in)) {}
+
+std::string GetOpName(opcodetype opcode)
 {
     switch (opcode)
     {
@@ -138,11 +147,13 @@ const char* GetOpName(opcodetype opcode)
     case OP_NOP9                   : return "OP_NOP9";
     case OP_NOP10                  : return "OP_NOP10";
 
+    // Opcode added by BIP 342 (Tapscript)
+    case OP_CHECKSIGADD            : return "OP_CHECKSIGADD";
+
     case OP_INVALIDOPCODE          : return "OP_INVALIDOPCODE";
 
-    default:
-        return "OP_UNKNOWN";
-    }
+    } // no default case, so the compiler can warn about missing cases
+    return "OP_UNKNOWN";
 }
 
 unsigned int CScript::GetSigOpCount(bool fAccurate) const
@@ -193,6 +204,23 @@ unsigned int CScript::GetSigOpCount(const CScript& scriptSig) const
     return subscript.GetSigOpCount(true);
 }
 
+bool CScript::IsPayToAnchor() const
+{
+    return (this->size() == 4 &&
+        (*this)[0] == OP_1 &&
+        (*this)[1] == 0x02 &&
+        (*this)[2] == 0x4e &&
+        (*this)[3] == 0x73);
+}
+
+bool CScript::IsPayToAnchor(int version, const std::vector<unsigned char>& program)
+{
+    return version == 1 &&
+        program.size() == 2 &&
+        program[0] == 0x4e &&
+        program[1] == 0x73;
+}
+
 bool CScript::IsPayToScriptHash() const
 {
     // Extra-fast test for pay-to-script-hash CScripts:
@@ -207,6 +235,13 @@ bool CScript::IsPayToWitnessScriptHash() const
     // Extra-fast test for pay-to-witness-script-hash CScripts:
     return (this->size() == 34 &&
             (*this)[0] == OP_0 &&
+            (*this)[1] == 0x20);
+}
+
+bool CScript::IsPayToTaproot() const
+{
+    return (this->size() == 34 &&
+            (*this)[0] == OP_1 &&
             (*this)[1] == 0x20);
 }
 
@@ -324,5 +359,38 @@ bool GetScriptOp(CScriptBase::const_iterator& pc, CScriptBase::const_iterator en
     }
 
     opcodeRet = static_cast<opcodetype>(opcode);
+    return true;
+}
+
+bool IsOpSuccess(const opcodetype& opcode)
+{
+    return opcode == 80 || opcode == 98 || (opcode >= 126 && opcode <= 129) ||
+           (opcode >= 131 && opcode <= 134) || (opcode >= 137 && opcode <= 138) ||
+           (opcode >= 141 && opcode <= 142) || (opcode >= 149 && opcode <= 153) ||
+           (opcode >= 187 && opcode <= 254);
+}
+
+bool CheckMinimalPush(const std::vector<unsigned char>& data, opcodetype opcode) {
+    // Excludes OP_1NEGATE, OP_1-16 since they are by definition minimal
+    assert(0 <= opcode && opcode <= OP_PUSHDATA4);
+    if (data.size() == 0) {
+        // Should have used OP_0.
+        return opcode == OP_0;
+    } else if (data.size() == 1 && data[0] >= 1 && data[0] <= 16) {
+        // Should have used OP_1 .. OP_16.
+        return false;
+    } else if (data.size() == 1 && data[0] == 0x81) {
+        // Should have used OP_1NEGATE.
+        return false;
+    } else if (data.size() <= 75) {
+        // Must have used a direct push (opcode indicating number of bytes pushed + those bytes).
+        return opcode == data.size();
+    } else if (data.size() <= 255) {
+        // Must have used OP_PUSHDATA.
+        return opcode == OP_PUSHDATA1;
+    } else if (data.size() <= 65535) {
+        // Must have used OP_PUSHDATA2.
+        return opcode == OP_PUSHDATA2;
+    }
     return true;
 }

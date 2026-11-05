@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-# Copyright (c) 2016-2020 The Bitcoin Core developers
+# Copyright (c) 2016-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test Hierarchical Deterministic wallet function."""
 
-import os
 import shutil
 
+from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
-    connect_nodes,
-    assert_raises_rpc_error
+    wallet_importprivkey,
+    assert_raises_rpc_error,
 )
 
 
@@ -20,10 +21,72 @@ class WalletHDTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 2
         self.extra_args = [[], ['-keypool=0']]
-        self.supports_cli = False
+        self.noban_tx_relay = True  # faster tx relay
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
+
+    def test_addhdkey(self):
+        self.log.info("Test addhdkey")
+        def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        self.nodes[0].createwallet("hdkey")
+        wallet = self.nodes[0].get_wallet_rpc("hdkey")
+
+        assert_equal(len(wallet.gethdkeys()), 1)
+
+        wallet.addhdkey()
+        xpub_info = wallet.gethdkeys()
+        assert_equal(len(xpub_info), 2)
+        for x in xpub_info:
+            if len(x["descriptors"]) == 1 and x["descriptors"][0]["desc"].startswith("unused("):
+                break
+        else:
+            assert False, "Did not find HD key with no descriptors"
+
+        imp_xpub_info = def_wallet.gethdkeys(private=True)[0]
+        imp_xpub = imp_xpub_info["xpub"]
+        imp_xprv = imp_xpub_info["xprv"]
+
+        assert_raises_rpc_error(-5, "Extended public key (xpub) provided, but extended private key (xprv) is required", wallet.addhdkey, imp_xpub)
+        assert_raises_rpc_error(-5, "Could not parse HD key", wallet.addhdkey, "not_an_extended_key")
+        add_res = wallet.addhdkey(imp_xprv)
+        expected_unused_desc = descsum_create(f"unused({imp_xpub})")
+        assert_equal(add_res["xpub"], imp_xpub)
+        xpub_info = wallet.gethdkeys()
+        assert_equal(len(xpub_info), 3)
+        for x in xpub_info:
+            if x["xpub"] == imp_xpub:
+                assert_equal(len(x["descriptors"]), 1)
+                assert_equal(x["descriptors"][0]["desc"], expected_unused_desc)
+                break
+        else:
+            assert False, "Added HD key was not found in wallet"
+
+        for d in wallet.listdescriptors()["descriptors"]:
+            if d["desc"] == expected_unused_desc:
+                assert_equal(d["active"], False)
+                break
+        else:
+            assert False, "Added HD key's descriptor was not found in wallet"
+
+        assert_raises_rpc_error(-4, "HD key already exists", wallet.addhdkey, imp_xprv)
+
+    def test_addhdkey_noprivs(self):
+        self.log.info("Test addhdkey is not available for wallets without privkeys")
+        self.nodes[0].createwallet("hdkey_noprivs", disable_private_keys=True)
+        wallet = self.nodes[0].get_wallet_rpc("hdkey_noprivs")
+        assert_raises_rpc_error(-4, "addhdkey is not available for wallets without private keys", wallet.addhdkey)
+
+    def test_addhdkey_locked(self):
+        self.log.info("Test addhdkey requires an unlocked wallet")
+        self.nodes[0].createwallet(wallet_name="hdkey_locked", passphrase="passphrase")
+        wallet = self.nodes[0].get_wallet_rpc("hdkey_locked")
+        wallet.walletlock()
+        assert_raises_rpc_error(-13, "Please enter the wallet passphrase with walletpassphrase first", wallet.addhdkey)
+        # Once unlocked, adding an HD key succeeds
+        wallet.walletpassphrase("passphrase", 100)
+        add_res = wallet.addhdkey()
+        assert "xpub" in add_res
 
     def run_test(self):
         # Make sure we use hd, keep masterkeyid
@@ -32,46 +95,36 @@ class WalletHDTest(BitcoinTestFramework):
 
         # create an internal key
         change_addr = self.nodes[1].getrawchangeaddress()
-        change_addrV= self.nodes[1].getaddressinfo(change_addr)
-        if self.options.descriptors:
-            assert_equal(change_addrV["hdkeypath"], "m/84'/1'/0'/1/0")
-        else:
-            assert_equal(change_addrV["hdkeypath"], "m/0'/1'/0'") #first internal child key
+        change_addrV = self.nodes[1].getaddressinfo(change_addr)
+        assert_equal(change_addrV["hdkeypath"], "m/84h/1h/0h/1/0")
 
         # Import a non-HD private key in the HD wallet
         non_hd_add = 'bcrt1qmevj8zfx0wdvp05cqwkmr6mxkfx60yezwjksmt'
         non_hd_key = 'cS9umN9w6cDMuRVYdbkfE4c7YUFLJRoXMfhQ569uY4odiQbVN8Rt'
-        self.nodes[1].importprivkey(non_hd_key)
+        wallet_importprivkey(self.nodes[1], non_hd_key, "now")
 
         # This should be enough to keep the master key and the non-HD key
-        self.nodes[1].backupwallet(os.path.join(self.nodes[1].datadir, "hd.bak"))
-        #self.nodes[1].dumpwallet(os.path.join(self.nodes[1].datadir, "hd.dump"))
+        self.nodes[1].backupwallet(self.nodes[1].datadir_path / "hd.bak")
 
         # Derive some HD addresses and remember the last
         # Also send funds to each add
-        self.nodes[0].generate(101)
+        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
         hd_add = None
         NUM_HD_ADDS = 10
         for i in range(1, NUM_HD_ADDS + 1):
             hd_add = self.nodes[1].getnewaddress()
             hd_info = self.nodes[1].getaddressinfo(hd_add)
-            if self.options.descriptors:
-                assert_equal(hd_info["hdkeypath"], "m/84'/1'/0'/0/" + str(i))
-            else:
-                assert_equal(hd_info["hdkeypath"], "m/0'/0'/"+str(i)+"'")
+            assert_equal(hd_info["hdkeypath"], "m/84h/1h/0h/0/" + str(i))
             assert_equal(hd_info["hdmasterfingerprint"], hd_fingerprint)
             self.nodes[0].sendtoaddress(hd_add, 1)
-            self.nodes[0].generate(1)
+            self.generate(self.nodes[0], 1)
         self.nodes[0].sendtoaddress(non_hd_add, 1)
-        self.nodes[0].generate(1)
+        self.generate(self.nodes[0], 1)
 
         # create an internal key (again)
         change_addr = self.nodes[1].getrawchangeaddress()
-        change_addrV= self.nodes[1].getaddressinfo(change_addr)
-        if self.options.descriptors:
-            assert_equal(change_addrV["hdkeypath"], "m/84'/1'/0'/1/1")
-        else:
-            assert_equal(change_addrV["hdkeypath"], "m/0'/1'/1'") #second internal child key
+        change_addrV = self.nodes[1].getaddressinfo(change_addr)
+        assert_equal(change_addrV["hdkeypath"], "m/84h/1h/0h/1/1")
 
         self.sync_all()
         assert_equal(self.nodes[1].getbalance(), NUM_HD_ADDS + 1)
@@ -80,9 +133,12 @@ class WalletHDTest(BitcoinTestFramework):
         self.stop_node(1)
         # we need to delete the complete chain directory
         # otherwise node1 would auto-recover all funds in flag the keypool keys as used
-        shutil.rmtree(os.path.join(self.nodes[1].datadir, self.chain, "blocks"))
-        shutil.rmtree(os.path.join(self.nodes[1].datadir, self.chain, "chainstate"))
-        shutil.copyfile(os.path.join(self.nodes[1].datadir, "hd.bak"), os.path.join(self.nodes[1].datadir, self.chain, 'wallets', "wallet.dat"))
+        self.cleanup_folder(self.nodes[1].blocks_path)
+        self.cleanup_folder(self.nodes[1].chain_path / "chainstate")
+        shutil.copyfile(
+            self.nodes[1].datadir_path / "hd.bak",
+            self.nodes[1].wallets_path / self.default_wallet_name / self.wallet_data_filename
+        )
         self.start_node(1)
 
         # Assert that derivation is deterministic
@@ -90,27 +146,26 @@ class WalletHDTest(BitcoinTestFramework):
         for i in range(1, NUM_HD_ADDS + 1):
             hd_add_2 = self.nodes[1].getnewaddress()
             hd_info_2 = self.nodes[1].getaddressinfo(hd_add_2)
-            if self.options.descriptors:
-                assert_equal(hd_info_2["hdkeypath"], "m/84'/1'/0'/0/" + str(i))
-            else:
-                assert_equal(hd_info_2["hdkeypath"], "m/0'/0'/"+str(i)+"'")
+            assert_equal(hd_info_2["hdkeypath"], "m/84h/1h/0h/0/" + str(i))
             assert_equal(hd_info_2["hdmasterfingerprint"], hd_fingerprint)
         assert_equal(hd_add, hd_add_2)
-        connect_nodes(self.nodes[0], 1)
+        self.connect_nodes(0, 1)
         self.sync_all()
 
         # Needs rescan
-        self.stop_node(1)
-        self.start_node(1, extra_args=self.extra_args[1] + ['-rescan'])
+        self.nodes[1].rescanblockchain()
         assert_equal(self.nodes[1].getbalance(), NUM_HD_ADDS + 1)
 
         # Try a RPC based rescan
         self.stop_node(1)
-        shutil.rmtree(os.path.join(self.nodes[1].datadir, self.chain, "blocks"))
-        shutil.rmtree(os.path.join(self.nodes[1].datadir, self.chain, "chainstate"))
-        shutil.copyfile(os.path.join(self.nodes[1].datadir, "hd.bak"), os.path.join(self.nodes[1].datadir, self.chain, "wallets", "wallet.dat"))
+        self.cleanup_folder(self.nodes[1].blocks_path)
+        self.cleanup_folder(self.nodes[1].chain_path / "chainstate")
+        shutil.copyfile(
+            self.nodes[1].datadir_path / "hd.bak",
+            self.nodes[1].wallets_path / self.default_wallet_name / self.wallet_data_filename
+        )
         self.start_node(1, extra_args=self.extra_args[1])
-        connect_nodes(self.nodes[0], 1)
+        self.connect_nodes(0, 1)
         self.sync_all()
         # Wallet automatically scans blocks older than key on startup
         assert_equal(self.nodes[1].getbalance(), NUM_HD_ADDS + 1)
@@ -124,51 +179,17 @@ class WalletHDTest(BitcoinTestFramework):
 
         # send a tx and make sure its using the internal chain for the changeoutput
         txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), 1)
-        outs = self.nodes[1].decoderawtransaction(self.nodes[1].gettransaction(txid)['hex'])['vout']
+        outs = self.nodes[1].gettransaction(txid=txid, verbose=True)['decoded']['vout']
         keypath = ""
         for out in outs:
             if out['value'] != 1:
-                keypath = self.nodes[1].getaddressinfo(out['scriptPubKey']['addresses'][0])['hdkeypath']
+                keypath = self.nodes[1].getaddressinfo(out['scriptPubKey']['address'])['hdkeypath']
 
-        if self.options.descriptors:
-            assert_equal(keypath[0:14], "m/84'/1'/0'/1/")
-        else:
-            assert_equal(keypath[0:7], "m/0'/1'")
+        assert_equal(keypath[0:14], "m/84h/1h/0h/1/")
 
-        if not self.options.descriptors:
-            # Generate a new HD seed on node 1 and make sure it is set
-            orig_masterkeyid = self.nodes[1].getwalletinfo()['hdseedid']
-            self.nodes[1].sethdseed()
-            new_masterkeyid = self.nodes[1].getwalletinfo()['hdseedid']
-            assert orig_masterkeyid != new_masterkeyid
-            addr = self.nodes[1].getnewaddress()
-            assert_equal(self.nodes[1].getaddressinfo(addr)['hdkeypath'], 'm/0\'/0\'/0\'') # Make sure the new address is the first from the keypool
-            self.nodes[1].keypoolrefill(1) # Fill keypool with 1 key
-
-            # Set a new HD seed on node 1 without flushing the keypool
-            new_seed = self.nodes[0].dumpprivkey(self.nodes[0].getnewaddress())
-            orig_masterkeyid = new_masterkeyid
-            self.nodes[1].sethdseed(False, new_seed)
-            new_masterkeyid = self.nodes[1].getwalletinfo()['hdseedid']
-            assert orig_masterkeyid != new_masterkeyid
-            addr = self.nodes[1].getnewaddress()
-            assert_equal(orig_masterkeyid, self.nodes[1].getaddressinfo(addr)['hdseedid'])
-            assert_equal(self.nodes[1].getaddressinfo(addr)['hdkeypath'], 'm/0\'/0\'/1\'') # Make sure the new address continues previous keypool
-
-            # Check that the next address is from the new seed
-            self.nodes[1].keypoolrefill(1)
-            next_addr = self.nodes[1].getnewaddress()
-            assert_equal(new_masterkeyid, self.nodes[1].getaddressinfo(next_addr)['hdseedid'])
-            assert_equal(self.nodes[1].getaddressinfo(next_addr)['hdkeypath'], 'm/0\'/0\'/0\'') # Make sure the new address is not from previous keypool
-            assert next_addr != addr
-
-            # Sethdseed parameter validity
-            assert_raises_rpc_error(-1, 'sethdseed', self.nodes[0].sethdseed, False, new_seed, 0)
-            assert_raises_rpc_error(-5, "Invalid private key", self.nodes[1].sethdseed, False, "not_wif")
-            assert_raises_rpc_error(-1, "JSON value is not a boolean as expected", self.nodes[1].sethdseed, "Not_bool")
-            assert_raises_rpc_error(-1, "JSON value is not a string as expected", self.nodes[1].sethdseed, False, True)
-            assert_raises_rpc_error(-5, "Already have this key", self.nodes[1].sethdseed, False, new_seed)
-            assert_raises_rpc_error(-5, "Already have this key", self.nodes[1].sethdseed, False, self.nodes[1].dumpprivkey(self.nodes[1].getnewaddress()))
+        self.test_addhdkey()
+        self.test_addhdkey_noprivs()
+        self.test_addhdkey_locked()
 
 if __name__ == '__main__':
-    WalletHDTest().main ()
+    WalletHDTest(__file__).main()

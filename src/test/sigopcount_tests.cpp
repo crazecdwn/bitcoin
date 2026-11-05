@@ -1,13 +1,16 @@
-// Copyright (c) 2012-2020 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
+#include <coins.h>
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
 #include <key.h>
 #include <pubkey.h>
+#include <script/interpreter.h>
 #include <script/script.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 
@@ -47,8 +50,7 @@ BOOST_AUTO_TEST_CASE(GetSigOpCount)
     std::vector<CPubKey> keys;
     for (int i = 0; i < 3; i++)
     {
-        CKey k;
-        k.MakeNewKey(true);
+        CKey k = GenerateRandomKey();
         keys.push_back(k.GetPubKey());
     }
     CScript s2 = GetScriptForMultisig(1, keys);
@@ -67,11 +69,11 @@ BOOST_AUTO_TEST_CASE(GetSigOpCount)
  * Verifies script execution of the zeroth scriptPubKey of tx output and
  * zeroth scriptSig and witness of tx input.
  */
-static ScriptError VerifyWithFlag(const CTransaction& output, const CMutableTransaction& input, int flags)
+static ScriptError VerifyWithFlag(const CTransaction& output, const CMutableTransaction& input, script_verify_flags flags)
 {
     ScriptError error;
     CTransaction inputi(input);
-    bool ret = VerifyScript(inputi.vin[0].scriptSig, output.vout[0].scriptPubKey, &inputi.vin[0].scriptWitness, flags, TransactionSignatureChecker(&inputi, 0, output.vout[0].nValue), &error);
+    bool ret = VerifyScript(inputi.vin[0].scriptSig, output.vout[0].scriptPubKey, &inputi.vin[0].scriptWitness, flags, TransactionSignatureChecker(&inputi, 0, output.vout[0].nValue, MissingDataBehavior::ASSERT_FAIL), &error);
     BOOST_CHECK((ret == true) == (error == SCRIPT_ERR_OK));
 
     return error;
@@ -84,23 +86,22 @@ static ScriptError VerifyWithFlag(const CTransaction& output, const CMutableTran
  */
 static void BuildTxs(CMutableTransaction& spendingTx, CCoinsViewCache& coins, CMutableTransaction& creationTx, const CScript& scriptPubKey, const CScript& scriptSig, const CScriptWitness& witness)
 {
-    creationTx.nVersion = 1;
-    creationTx.vin.resize(1);
-    creationTx.vin[0].prevout.SetNull();
-    creationTx.vin[0].scriptSig = CScript();
-    creationTx.vout.resize(1);
-    creationTx.vout[0].nValue = 1;
-    creationTx.vout[0].scriptPubKey = scriptPubKey;
+    creationTx.version = 1;
+    creationTx.vin = {
+        CTxIn{COutPoint{}},
+    };
+    creationTx.vout = {
+        CTxOut{1, scriptPubKey},
+    };
 
-    spendingTx.nVersion = 1;
-    spendingTx.vin.resize(1);
-    spendingTx.vin[0].prevout.hash = creationTx.GetHash();
-    spendingTx.vin[0].prevout.n = 0;
-    spendingTx.vin[0].scriptSig = scriptSig;
+    spendingTx.version = 1;
+    spendingTx.vin = {
+        CTxIn{COutPoint{creationTx.GetHash(), 0}, scriptSig},
+    };
     spendingTx.vin[0].scriptWitness = witness;
-    spendingTx.vout.resize(1);
-    spendingTx.vout[0].nValue = 1;
-    spendingTx.vout[0].scriptPubKey = CScript();
+    spendingTx.vout = {
+        CTxOut{1, CScript{}},
+    };
 
     AddCoins(coins, CTransaction(creationTx), 0);
 }
@@ -114,14 +115,12 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
     CMutableTransaction spendingTx;
 
     // Create utxo set
-    CCoinsView coinsDummy;
-    CCoinsViewCache coins(&coinsDummy);
+    CCoinsViewCache coins{&CoinsViewEmpty::Get()};
     // Create key
-    CKey key;
-    key.MakeNewKey(true);
+    CKey key = GenerateRandomKey();
     CPubKey pubkey = key.GetPubKey();
     // Default flags
-    int flags = SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_P2SH;
+    const script_verify_flags flags{SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_P2SH};
 
     // Multisig script (legacy counting)
     {
@@ -150,16 +149,18 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
         BuildTxs(spendingTx, coins, creationTx, scriptPubKey, scriptSig, CScriptWitness());
         assert(GetTransactionSigOpCost(CTransaction(spendingTx), coins, flags) == 2 * WITNESS_SCALE_FACTOR);
         assert(VerifyWithFlag(CTransaction(creationTx), spendingTx, flags) == SCRIPT_ERR_CHECKMULTISIGVERIFY);
+
+        // P2SH sigops are not counted if we don't set the SCRIPT_VERIFY_P2SH flag
+        assert(GetTransactionSigOpCost(CTransaction(spendingTx), coins, /*flags=*/0) == 0);
     }
 
     // P2WPKH witness program
     {
-        CScript p2pk = CScript() << ToByteVector(pubkey) << OP_CHECKSIG;
-        CScript scriptPubKey = GetScriptForWitness(p2pk);
+        CScript scriptPubKey = GetScriptForDestination(WitnessV0KeyHash(pubkey));
         CScript scriptSig = CScript();
         CScriptWitness scriptWitness;
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(0);
 
 
         BuildTxs(spendingTx, coins, creationTx, scriptPubKey, scriptSig, scriptWitness);
@@ -183,13 +184,12 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
 
     // P2WPKH nested in P2SH
     {
-        CScript p2pk = CScript() << ToByteVector(pubkey) << OP_CHECKSIG;
-        CScript scriptSig = GetScriptForWitness(p2pk);
+        CScript scriptSig = GetScriptForDestination(WitnessV0KeyHash(pubkey));
         CScript scriptPubKey = GetScriptForDestination(ScriptHash(scriptSig));
         scriptSig = CScript() << ToByteVector(scriptSig);
         CScriptWitness scriptWitness;
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(0);
 
         BuildTxs(spendingTx, coins, creationTx, scriptPubKey, scriptSig, scriptWitness);
         assert(GetTransactionSigOpCost(CTransaction(spendingTx), coins, flags) == 1);
@@ -199,12 +199,12 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
     // P2WSH witness program
     {
         CScript witnessScript = CScript() << 1 << ToByteVector(pubkey) << ToByteVector(pubkey) << 2 << OP_CHECKMULTISIGVERIFY;
-        CScript scriptPubKey = GetScriptForWitness(witnessScript);
+        CScript scriptPubKey = GetScriptForDestination(WitnessV0ScriptHash(witnessScript));
         CScript scriptSig = CScript();
         CScriptWitness scriptWitness;
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(witnessScript.begin(), witnessScript.end()));
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(witnessScript.begin(), witnessScript.end());
 
         BuildTxs(spendingTx, coins, creationTx, scriptPubKey, scriptSig, scriptWitness);
         assert(GetTransactionSigOpCost(CTransaction(spendingTx), coins, flags) == 2);
@@ -215,13 +215,13 @@ BOOST_AUTO_TEST_CASE(GetTxSigOpCost)
     // P2WSH nested in P2SH
     {
         CScript witnessScript = CScript() << 1 << ToByteVector(pubkey) << ToByteVector(pubkey) << 2 << OP_CHECKMULTISIGVERIFY;
-        CScript redeemScript = GetScriptForWitness(witnessScript);
+        CScript redeemScript = GetScriptForDestination(WitnessV0ScriptHash(witnessScript));
         CScript scriptPubKey = GetScriptForDestination(ScriptHash(redeemScript));
         CScript scriptSig = CScript() << ToByteVector(redeemScript);
         CScriptWitness scriptWitness;
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(0));
-        scriptWitness.stack.push_back(std::vector<unsigned char>(witnessScript.begin(), witnessScript.end()));
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(0);
+        scriptWitness.stack.emplace_back(witnessScript.begin(), witnessScript.end());
 
         BuildTxs(spendingTx, coins, creationTx, scriptPubKey, scriptSig, scriptWitness);
         assert(GetTransactionSigOpCost(CTransaction(spendingTx), coins, flags) == 2);

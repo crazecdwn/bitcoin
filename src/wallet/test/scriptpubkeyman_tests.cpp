@@ -1,43 +1,54 @@
-// Copyright (c) 2020 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <key.h>
-#include <script/standard.h>
+#include <key_io.h>
+#include <test/util/common.h>
 #include <test/util/setup_common.h>
+#include <script/solver.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
+#include <wallet/test/util.h>
 
 #include <boost/test/unit_test.hpp>
 
+namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(scriptpubkeyman_tests, BasicTestingSetup)
 
-// Test LegacyScriptPubKeyMan::CanProvide behavior, making sure it returns true
-// for recognized scripts even when keys may not be available for signing.
-BOOST_AUTO_TEST_CASE(CanProvide)
+BOOST_AUTO_TEST_CASE(DescriptorScriptPubKeyManTests)
 {
-    // Set up wallet and keyman variables.
-    NodeContext node;
-    std::unique_ptr<interfaces::Chain> chain = interfaces::MakeChain(node);
-    CWallet wallet(chain.get(), WalletLocation(), WalletDatabase::CreateDummy());
-    LegacyScriptPubKeyMan& keyman = *wallet.GetOrCreateLegacyScriptPubKeyMan();
+    std::unique_ptr<interfaces::Chain>& chain = m_node.chain;
 
-    // Make a 1 of 2 multisig script
-    std::vector<CKey> keys(2);
-    std::vector<CPubKey> pubkeys;
-    for (CKey& key : keys) {
-        key.MakeNewKey(true);
-        pubkeys.emplace_back(key.GetPubKey());
-    }
-    CScript multisig_script = GetScriptForMultisig(1, pubkeys);
-    CScript p2sh_script = GetScriptForDestination(ScriptHash(multisig_script));
-    SignatureData data;
+    CWallet keystore(chain.get(), "", CreateMockableWalletDatabase());
+    auto key_scriptpath = GenerateRandomKey();
 
-    // Verify the p2sh(multisig) script is not recognized until the multisig
-    // script is added to the keystore to make it solvable
-    BOOST_CHECK(!keyman.CanProvide(p2sh_script, data));
-    keyman.AddCScript(multisig_script);
-    BOOST_CHECK(keyman.CanProvide(p2sh_script, data));
+    // Verify that a SigningProvider for a pubkey is only returned if its corresponding private key is available
+    auto key_internal = GenerateRandomKey();
+    std::string desc_str = "tr(" + EncodeSecret(key_internal) + ",pk(" + HexStr(key_scriptpath.GetPubKey()) + "))";
+    auto spk_man1 = CreateDescriptor(keystore, desc_str, true);
+    BOOST_CHECK(spk_man1 != nullptr);
+    auto signprov_keypath_spendable = spk_man1->GetSigningProvider(key_internal.GetPubKey());
+    BOOST_CHECK(signprov_keypath_spendable != nullptr);
+
+    desc_str = "tr(" + HexStr(XOnlyPubKey::NUMS_H) + ",pk(" + HexStr(key_scriptpath.GetPubKey()) + "))";
+    auto spk_man2 = CreateDescriptor(keystore, desc_str, true);
+    BOOST_CHECK(spk_man2 != nullptr);
+    auto signprov_keypath_nums_h = spk_man2->GetSigningProvider(XOnlyPubKey::NUMS_H.GetEvenCorrespondingCPubKey());
+    BOOST_CHECK(signprov_keypath_nums_h == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(desc_spkm_topup_fail)
+{
+    // Attempting to construct a DescriptorSPKM that cannot be topped up (hardened derivation without private keys)
+    // should throw even though it is valid and can be parsed
+    CExtKey extkey;
+    extkey.SetSeed(std::array<std::byte, 32>{});
+    CWallet keystore(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_CHECK_EXCEPTION(
+        CreateDescriptor(keystore, "wpkh(" + EncodeExtPubKey(extkey.Neuter()) + "/*h)", /*success=*/true),
+        std::runtime_error, HasReason("Could not top up scriptPubKeys"));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+} // namespace wallet

@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-# Copyright (c) 2014-2019 The Bitcoin Core developers
+# Copyright (c) 2014-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test running bitcoind with the -rpcbind and -rpcallowip options."""
 
-import sys
-
-from test_framework.netutil import all_interfaces, addr_to_hex, get_bind_addrs, test_ipv6_local
+from test_framework.netutil import NETWORK_ERRORS, all_interfaces, addr_to_hex, get_bind_addrs, test_ipv6_local
 from test_framework.test_framework import BitcoinTestFramework, SkipTest
-from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy, rpc_port, rpc_url
+from test_framework.test_node import ErrorMatch
+from test_framework.util import assert_equal, rpc_port
 
 class RPCBindTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
         self.bind_to_localhost_only = False
         self.num_nodes = 1
-        self.supports_cli = False
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_platform_not_posix()
+        self.skip_if_no_lsof_on_nonlinux()
 
     def setup_network(self):
         self.add_nodes(self.num_nodes, None)
@@ -43,11 +45,25 @@ class RPCBindTest(BitcoinTestFramework):
         assert_equal(set(get_bind_addrs(pid)), set(expected))
         self.stop_nodes()
 
+    def run_invalid_bind_test(self, allow_ips, addresses):
+        '''
+        Attempt to start a node with requested rpcallowip and rpcbind
+        parameters, expecting that the node will fail.
+        '''
+        self.log.info(f'Invalid bind test for {addresses}')
+        base_args = ['-disablewallet', '-nolisten']
+        if allow_ips:
+            base_args += ['-rpcallowip=' + x for x in allow_ips]
+        init_error = 'Error: Invalid port specified in -rpcbind: '
+        for addr in addresses:
+            self.nodes[0].assert_start_raises_init_error(base_args + [f'-rpcbind={addr}'], init_error + f"'{addr}'")
+
     def run_allowip_test(self, allow_ips, rpchost, rpcport):
         '''
         Start a node with rpcallow IP, and request getnetworkinfo
         at a non-localhost IP.
         '''
+        success = True
         self.log.info("Allow IP test for %s:%d" % (rpchost, rpcport))
         node_args = \
             ['-disablewallet', '-nolisten'] + \
@@ -55,19 +71,38 @@ class RPCBindTest(BitcoinTestFramework):
             ['-rpcbind='+addr for addr in ['127.0.0.1', "%s:%d" % (rpchost, rpcport)]] # Bind to localhost as well so start_nodes doesn't hang
         self.nodes[0].rpchost = None
         self.start_nodes([node_args])
+        self.nodes[0].rpchost = f"{rpchost}:{rpcport}"
         # connect to node through non-loopback interface
-        node = get_rpc_proxy(rpc_url(self.nodes[0].datadir, 0, self.chain, "%s:%d" % (rpchost, rpcport)), 0, coveragedir=self.options.coveragedir)
-        node.getnetworkinfo()
+        node = self.nodes[0].create_new_rpc_connection()
+        try:
+            node.getnetworkinfo()
+        except NETWORK_ERRORS:
+            success = False
+        self.stop_nodes()
+        return success
+
+    def run_invalid_allowip_test(self):
+        '''
+        Check parameter interaction with -rpcallowip and -cjdnsreachable.
+        RFC4193 addresses are fc00::/7 like CJDNS but have an optional
+        "local" L bit making them fd00:: which should always be OK.
+        '''
+        self.log.info("Allow RFC4193 when compatible with CJDNS options")
+        # Don't rpcallow RFC4193 with L-bit=0 if CJDNS is enabled
+        self.nodes[0].assert_start_raises_init_error(
+            ["-rpcallowip=fc00:db8:c0:ff:ee::/80","-cjdnsreachable"],
+            "Invalid -rpcallowip subnet specification",
+            match=ErrorMatch.PARTIAL_REGEX)
+        # OK to rpcallow RFC4193 with L-bit=1 if CJDNS is enabled
+        self.start_node(0, ["-rpcallowip=fd00:db8:c0:ff:ee::/80","-cjdnsreachable"])
+        self.stop_nodes()
+        # OK to rpcallow RFC4193 with L-bit=0 if CJDNS is not enabled
+        self.start_node(0, ["-rpcallowip=fc00:db8:c0:ff:ee::/80"])
         self.stop_nodes()
 
     def run_test(self):
-        # due to OS-specific network stats queries, this test works only on Linux
         if sum([self.options.run_ipv4, self.options.run_ipv6, self.options.run_nonloopback]) > 1:
             raise AssertionError("Only one of --ipv4, --ipv6 and --nonloopback can be set")
-
-        self.log.info("Check for linux")
-        if not sys.platform.startswith('linux'):
-            raise SkipTest("This test can only be run on linux.")
 
         self.log.info("Check for ipv6")
         have_ipv6 = test_ipv6_local()
@@ -75,9 +110,12 @@ class RPCBindTest(BitcoinTestFramework):
             raise SkipTest("This test requires ipv6 support.")
 
         self.log.info("Check for non-loopback interface")
+        interfaces = all_interfaces()
+        if not interfaces:
+            raise AssertionError("all_interfaces() returned no IPv4 interfaces")
         self.non_loopback_ip = None
-        for name,ip in all_interfaces():
-            if ip != '127.0.0.1':
+        for name,ip in interfaces:
+            if not ip.startswith('127.'):
                 self.non_loopback_ip = ip
                 break
         if self.non_loopback_ip is None and self.options.run_nonloopback:
@@ -87,8 +125,16 @@ class RPCBindTest(BitcoinTestFramework):
 
         if not self.options.run_nonloopback:
             self._run_loopback_tests()
+            if self.options.run_ipv4:
+                self.run_invalid_bind_test(['127.0.0.1'], ['127.0.0.1:notaport', '127.0.0.1:-18443', '127.0.0.1:0', '127.0.0.1:65536'])
+            if self.options.run_ipv6:
+                self.run_invalid_bind_test(['[::1]'], ['[::1]:notaport', '[::1]:-18443', '[::1]:0', '[::1]:65536'])
+                self.run_invalid_allowip_test()
         if not self.options.run_ipv4 and not self.options.run_ipv6:
-            self._run_nonloopback_tests()
+            if self.non_loopback_ip:
+                self._run_nonloopback_tests()
+            else:
+                self.log.info('Non-loopback IP address not found, skipping non-loopback tests')
 
     def _run_loopback_tests(self):
         if self.options.run_ipv4:
@@ -122,9 +168,13 @@ class RPCBindTest(BitcoinTestFramework):
         self.run_bind_test([self.non_loopback_ip], self.non_loopback_ip, [self.non_loopback_ip],
             [(self.non_loopback_ip, self.defaultport)])
 
-        # Check that with invalid rpcallowip, we are denied
-        self.run_allowip_test([self.non_loopback_ip], self.non_loopback_ip, self.defaultport)
-        assert_raises_rpc_error(-342, "non-JSON HTTP response with '403 Forbidden' from server", self.run_allowip_test, ['1.1.1.1'], self.non_loopback_ip, self.defaultport)
+        # Check that connections from allowed IPs are allowed
+        assert self.run_allowip_test([self.non_loopback_ip], self.non_loopback_ip, self.defaultport)
+        # Otherwise we are denied
+        if self.options.usecli:
+            self.log.info("Skip negative IP test with CLI, because the CLI can not throw the tested exception type")
+            return
+        assert not self.run_allowip_test(['1.1.1.1'], self.non_loopback_ip, self.defaultport)
 
 if __name__ == '__main__':
-    RPCBindTest().main()
+    RPCBindTest(__file__).main()

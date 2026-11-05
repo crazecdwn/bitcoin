@@ -1,15 +1,16 @@
-// Copyright (c) 2012-2020 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <checkqueue.h>
+#include <common/args.h>
+#include <sync.h>
+#include <test/util/random.h>
 #include <test/util/setup_common.h>
-#include <util/memory.h>
-#include <util/system.h>
+#include <util/chaintype.h>
 #include <util/time.h>
 
 #include <boost/test/unit_test.hpp>
-#include <boost/thread.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -19,67 +20,71 @@
 #include <utility>
 #include <vector>
 
-BOOST_FIXTURE_TEST_SUITE(checkqueue_tests, TestingSetup)
+/**
+ * Identical to BasicTestingSetup but excludes lock contention logging if
+ * `DEBUG_LOCKCONTENTION` is defined, as some of these tests are designed to be
+ * heavily contested to trigger race conditions or other issues.
+ */
+struct NoLockLoggingTestingSetup : public BasicTestingSetup {
+    NoLockLoggingTestingSetup()
+#ifdef DEBUG_LOCKCONTENTION
+        : BasicTestingSetup{ChainType::MAIN, {.extra_args = { "-debugexclude=lock" } }} {}
+#else
+        : BasicTestingSetup{ChainType::MAIN} {}
+#endif
+};
+
+struct CheckQueueTest : NoLockLoggingTestingSetup {
+    void Correct_Queue_range(std::vector<size_t> range);
+};
 
 static const unsigned int QUEUE_BATCH_SIZE = 128;
 static const int SCRIPT_CHECK_THREADS = 3;
 
 struct FakeCheck {
-    bool operator()()
+    std::optional<int> operator()() const
     {
-        return true;
+        return std::nullopt;
     }
-    void swap(FakeCheck& x){};
 };
 
 struct FakeCheckCheckCompletion {
     static std::atomic<size_t> n_calls;
-    bool operator()()
+    std::optional<int> operator()()
     {
         n_calls.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return std::nullopt;
     }
-    void swap(FakeCheckCheckCompletion& x){};
 };
 
-struct FailingCheck {
-    bool fails;
-    FailingCheck(bool _fails) : fails(_fails){};
-    FailingCheck() : fails(true){};
-    bool operator()()
-    {
-        return !fails;
-    }
-    void swap(FailingCheck& x)
-    {
-        std::swap(fails, x.fails);
-    };
+struct FixedCheck
+{
+    std::optional<int> m_result;
+    FixedCheck(std::optional<int> result) : m_result(result){};
+    std::optional<int> operator()() const { return m_result; }
 };
 
 struct UniqueCheck {
-    static std::mutex m;
-    static std::unordered_multiset<size_t> results;
+    static Mutex m;
+    static std::unordered_multiset<size_t> results GUARDED_BY(m);
     size_t check_id;
     UniqueCheck(size_t check_id_in) : check_id(check_id_in){};
-    UniqueCheck() : check_id(0){};
-    bool operator()()
+    std::optional<int> operator()()
     {
-        std::lock_guard<std::mutex> l(m);
+        LOCK(m);
         results.insert(check_id);
-        return true;
+        return std::nullopt;
     }
-    void swap(UniqueCheck& x) { std::swap(x.check_id, check_id); };
 };
 
 
 struct MemoryCheck {
     static std::atomic<size_t> fake_allocated_memory;
     bool b {false};
-    bool operator()()
+    std::optional<int> operator()() const
     {
-        return true;
+        return std::nullopt;
     }
-    MemoryCheck(){};
     MemoryCheck(const MemoryCheck& x)
     {
         // We have to do this to make sure that destructor calls are paired
@@ -96,21 +101,18 @@ struct MemoryCheck {
     {
         fake_allocated_memory.fetch_sub(b, std::memory_order_relaxed);
     };
-    void swap(MemoryCheck& x) { std::swap(b, x.b); };
 };
 
 struct FrozenCleanupCheck {
     static std::atomic<uint64_t> nFrozen;
     static std::condition_variable cv;
     static std::mutex m;
-    // Freezing can't be the default initialized behavior given how the queue
-    // swaps in default initialized Checks.
-    bool should_freeze {false};
-    bool operator()()
+    bool should_freeze{true};
+    std::optional<int> operator()() const
     {
-        return true;
+        return std::nullopt;
     }
-    FrozenCleanupCheck() {}
+    FrozenCleanupCheck() = default;
     ~FrozenCleanupCheck()
     {
         if (should_freeze) {
@@ -120,14 +122,24 @@ struct FrozenCleanupCheck {
             cv.wait(l, []{ return nFrozen.load(std::memory_order_relaxed) == 0;});
         }
     }
-    void swap(FrozenCleanupCheck& x){std::swap(should_freeze, x.should_freeze);};
+    FrozenCleanupCheck(FrozenCleanupCheck&& other) noexcept
+    {
+        should_freeze = other.should_freeze;
+        other.should_freeze = false;
+    }
+    FrozenCleanupCheck& operator=(FrozenCleanupCheck&& other) noexcept
+    {
+        should_freeze = other.should_freeze;
+        other.should_freeze = false;
+        return *this;
+    }
 };
 
 // Static Allocations
 std::mutex FrozenCleanupCheck::m{};
 std::atomic<uint64_t> FrozenCleanupCheck::nFrozen{0};
 std::condition_variable FrozenCleanupCheck::cv{};
-std::mutex UniqueCheck::m;
+Mutex UniqueCheck::m;
 std::unordered_multiset<size_t> UniqueCheck::results;
 std::atomic<size_t> FakeCheckCheckCompletion::n_calls{0};
 std::atomic<size_t> MemoryCheck::fake_allocated_memory{0};
@@ -135,7 +147,7 @@ std::atomic<size_t> MemoryCheck::fake_allocated_memory{0};
 // Queue Typedefs
 typedef CCheckQueue<FakeCheckCheckCompletion> Correct_Queue;
 typedef CCheckQueue<FakeCheck> Standard_Queue;
-typedef CCheckQueue<FailingCheck> Failing_Queue;
+typedef CCheckQueue<FixedCheck> Fixed_Queue;
 typedef CCheckQueue<UniqueCheck> Unique_Queue;
 typedef CCheckQueue<MemoryCheck> Memory_Queue;
 typedef CCheckQueue<FrozenCleanupCheck> FrozenCleanup_Queue;
@@ -144,39 +156,35 @@ typedef CCheckQueue<FrozenCleanupCheck> FrozenCleanup_Queue;
 /** This test case checks that the CCheckQueue works properly
  * with each specified size_t Checks pushed.
  */
-static void Correct_Queue_range(std::vector<size_t> range)
+void CheckQueueTest::Correct_Queue_range(std::vector<size_t> range)
 {
-    auto small_queue = MakeUnique<Correct_Queue>(QUEUE_BATCH_SIZE);
-    boost::thread_group tg;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-       tg.create_thread([&]{small_queue->Thread();});
-    }
+    auto small_queue = std::make_unique<Correct_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     // Make vChecks here to save on malloc (this test can be slow...)
     std::vector<FakeCheckCheckCompletion> vChecks;
+    vChecks.reserve(9);
     for (const size_t i : range) {
         size_t total = i;
         FakeCheckCheckCompletion::n_calls = 0;
-        CCheckQueueControl<FakeCheckCheckCompletion> control(small_queue.get());
+        CCheckQueueControl<FakeCheckCheckCompletion> control(*small_queue);
         while (total) {
-            vChecks.resize(std::min(total, (size_t) InsecureRandRange(10)));
+            vChecks.clear();
+            vChecks.resize(std::min<size_t>(total, m_rng.randrange(10)));
             total -= vChecks.size();
-            control.Add(vChecks);
+            control.Add(std::move(vChecks));
         }
-        BOOST_REQUIRE(control.Wait());
-        if (FakeCheckCheckCompletion::n_calls != i) {
-            BOOST_REQUIRE_EQUAL(FakeCheckCheckCompletion::n_calls, i);
-        }
+        BOOST_REQUIRE(!control.Complete().has_value());
+        BOOST_REQUIRE_EQUAL(FakeCheckCheckCompletion::n_calls, i);
     }
-    tg.interrupt_all();
-    tg.join_all();
 }
+
+BOOST_FIXTURE_TEST_SUITE(checkqueue_tests, CheckQueueTest)
 
 /** Test that 0 checks is correct
  */
 BOOST_AUTO_TEST_CASE(test_CheckQueue_Correct_Zero)
 {
     std::vector<size_t> range;
-    range.push_back((size_t)0);
+    range.push_back(size_t{0});
     Correct_Queue_range(range);
 }
 /** Test that 1 check is correct
@@ -184,7 +192,7 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_Correct_Zero)
 BOOST_AUTO_TEST_CASE(test_CheckQueue_Correct_One)
 {
     std::vector<size_t> range;
-    range.push_back((size_t)1);
+    range.push_back(size_t{1});
     Correct_Queue_range(range);
 }
 /** Test that MAX check is correct
@@ -201,69 +209,55 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_Correct_Random)
 {
     std::vector<size_t> range;
     range.reserve(100000/1000);
-    for (size_t i = 2; i < 100000; i += std::max((size_t)1, (size_t)InsecureRandRange(std::min((size_t)1000, ((size_t)100000) - i))))
+    for (size_t i = 2; i < 100000; i += std::max((size_t)1, (size_t)m_rng.randrange(std::min((size_t)1000, ((size_t)100000) - i))))
         range.push_back(i);
     Correct_Queue_range(range);
 }
 
 
-/** Test that failing checks are caught */
+/** Test that distinct failing checks are caught */
 BOOST_AUTO_TEST_CASE(test_CheckQueue_Catches_Failure)
 {
-    auto fail_queue = MakeUnique<Failing_Queue>(QUEUE_BATCH_SIZE);
-
-    boost::thread_group tg;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-       tg.create_thread([&]{fail_queue->Thread();});
-    }
-
+    auto fixed_queue = std::make_unique<Fixed_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     for (size_t i = 0; i < 1001; ++i) {
-        CCheckQueueControl<FailingCheck> control(fail_queue.get());
+        CCheckQueueControl<FixedCheck> control(*fixed_queue);
         size_t remaining = i;
         while (remaining) {
-            size_t r = InsecureRandRange(10);
+            size_t r = m_rng.randrange(10);
 
-            std::vector<FailingCheck> vChecks;
+            std::vector<FixedCheck> vChecks;
             vChecks.reserve(r);
             for (size_t k = 0; k < r && remaining; k++, remaining--)
-                vChecks.emplace_back(remaining == 1);
-            control.Add(vChecks);
+                vChecks.emplace_back(remaining == 1 ? std::make_optional<int>(17 * i) : std::nullopt);
+            control.Add(std::move(vChecks));
         }
-        bool success = control.Wait();
+        auto result = control.Complete();
         if (i > 0) {
-            BOOST_REQUIRE(!success);
-        } else if (i == 0) {
-            BOOST_REQUIRE(success);
+            BOOST_REQUIRE(result.has_value());
+            BOOST_REQUIRE(*result == static_cast<int>(17 * i));
+        } else {
+            BOOST_REQUIRE(!result.has_value());
         }
     }
-    tg.interrupt_all();
-    tg.join_all();
 }
 // Test that a block validation which fails does not interfere with
 // future blocks, ie, the bad state is cleared.
 BOOST_AUTO_TEST_CASE(test_CheckQueue_Recovers_From_Failure)
 {
-    auto fail_queue = MakeUnique<Failing_Queue>(QUEUE_BATCH_SIZE);
-    boost::thread_group tg;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-       tg.create_thread([&]{fail_queue->Thread();});
-    }
-
+    auto fail_queue = std::make_unique<Fixed_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     for (auto times = 0; times < 10; ++times) {
         for (const bool end_fails : {true, false}) {
-            CCheckQueueControl<FailingCheck> control(fail_queue.get());
+            CCheckQueueControl<FixedCheck> control(*fail_queue);
             {
-                std::vector<FailingCheck> vChecks;
-                vChecks.resize(100, false);
-                vChecks[99] = end_fails;
-                control.Add(vChecks);
+                std::vector<FixedCheck> vChecks;
+                vChecks.resize(100, FixedCheck(std::nullopt));
+                vChecks[99] = FixedCheck(end_fails ? std::make_optional<int>(2) : std::nullopt);
+                control.Add(std::move(vChecks));
             }
-            bool r =control.Wait();
+            bool r = !control.Complete().has_value();
             BOOST_REQUIRE(r != end_fails);
         }
     }
-    tg.interrupt_all();
-    tg.join_all();
 }
 
 // Test that unique checks are actually all called individually, rather than
@@ -271,32 +265,28 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_Recovers_From_Failure)
 // more than once as well
 BOOST_AUTO_TEST_CASE(test_CheckQueue_UniqueCheck)
 {
-    auto queue = MakeUnique<Unique_Queue>(QUEUE_BATCH_SIZE);
-    boost::thread_group tg;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-       tg.create_thread([&]{queue->Thread();});
-
-    }
-
+    auto queue = std::make_unique<Unique_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     size_t COUNT = 100000;
     size_t total = COUNT;
     {
-        CCheckQueueControl<UniqueCheck> control(queue.get());
+        CCheckQueueControl<UniqueCheck> control(*queue);
         while (total) {
-            size_t r = InsecureRandRange(10);
+            size_t r = m_rng.randrange(10);
             std::vector<UniqueCheck> vChecks;
             for (size_t k = 0; k < r && total; k++)
                 vChecks.emplace_back(--total);
-            control.Add(vChecks);
+            control.Add(std::move(vChecks));
         }
     }
-    bool r = true;
-    BOOST_REQUIRE_EQUAL(UniqueCheck::results.size(), COUNT);
-    for (size_t i = 0; i < COUNT; ++i)
-        r = r && UniqueCheck::results.count(i) == 1;
-    BOOST_REQUIRE(r);
-    tg.interrupt_all();
-    tg.join_all();
+    {
+        LOCK(UniqueCheck::m);
+        bool r = true;
+        BOOST_REQUIRE_EQUAL(UniqueCheck::results.size(), COUNT);
+        for (size_t i = 0; i < COUNT; ++i) {
+            r = r && UniqueCheck::results.count(i) == 1;
+        }
+        BOOST_REQUIRE(r);
+    }
 }
 
 
@@ -307,17 +297,13 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_UniqueCheck)
 // time could leave the data hanging across a sequence of blocks.
 BOOST_AUTO_TEST_CASE(test_CheckQueue_Memory)
 {
-    auto queue = MakeUnique<Memory_Queue>(QUEUE_BATCH_SIZE);
-    boost::thread_group tg;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-       tg.create_thread([&]{queue->Thread();});
-    }
+    auto queue = std::make_unique<Memory_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     for (size_t i = 0; i < 1000; ++i) {
         size_t total = i;
         {
-            CCheckQueueControl<MemoryCheck> control(queue.get());
+            CCheckQueueControl<MemoryCheck> control(*queue);
             while (total) {
-                size_t r = InsecureRandRange(10);
+                size_t r = m_rng.randrange(10);
                 std::vector<MemoryCheck> vChecks;
                 for (size_t k = 0; k < r && total; k++) {
                     total--;
@@ -325,35 +311,25 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_Memory)
                     // to catch any sort of deallocation failure
                     vChecks.emplace_back(total == 0 || total == i || total == i/2);
                 }
-                control.Add(vChecks);
+                control.Add(std::move(vChecks));
             }
         }
         BOOST_REQUIRE_EQUAL(MemoryCheck::fake_allocated_memory, 0U);
     }
-    tg.interrupt_all();
-    tg.join_all();
 }
 
 // Test that a new verification cannot occur until all checks
 // have been destructed
 BOOST_AUTO_TEST_CASE(test_CheckQueue_FrozenCleanup)
 {
-    auto queue = MakeUnique<FrozenCleanup_Queue>(QUEUE_BATCH_SIZE);
-    boost::thread_group tg;
+    auto queue = std::make_unique<FrozenCleanup_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     bool fails = false;
-    for (auto x = 0; x < SCRIPT_CHECK_THREADS; ++x) {
-        tg.create_thread([&]{queue->Thread();});
-    }
     std::thread t0([&]() {
-        CCheckQueueControl<FrozenCleanupCheck> control(queue.get());
+        CCheckQueueControl<FrozenCleanupCheck> control(*queue);
         std::vector<FrozenCleanupCheck> vChecks(1);
-        // Freezing can't be the default initialized behavior given how the queue
-        // swaps in default initialized Checks (otherwise freezing destructor
-        // would get called twice).
-        vChecks[0].should_freeze = true;
-        control.Add(vChecks);
-        bool waitResult = control.Wait(); // Hangs here
-        assert(waitResult);
+        control.Add(std::move(vChecks));
+        auto result = control.Complete(); // Hangs here
+        assert(!result);
     });
     {
         std::unique_lock<std::mutex> l(FrozenCleanupCheck::m);
@@ -362,7 +338,7 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_FrozenCleanup)
     }
     // Try to get control of the queue a bunch of times
     for (auto x = 0; x < 100 && !fails; ++x) {
-        fails = queue->ControlMutex.try_lock();
+        fails = queue->m_control_mutex.try_lock();
     }
     {
         // Unfreeze (we need lock n case of spurious wakeup)
@@ -373,8 +349,6 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_FrozenCleanup)
     FrozenCleanupCheck::cv.notify_one();
     // Wait for control to finish
     t0.join();
-    tg.interrupt_all();
-    tg.join_all();
     BOOST_REQUIRE(!fails);
 }
 
@@ -382,26 +356,29 @@ BOOST_AUTO_TEST_CASE(test_CheckQueue_FrozenCleanup)
 /** Test that CCheckQueueControl is threadsafe */
 BOOST_AUTO_TEST_CASE(test_CheckQueueControl_Locks)
 {
-    auto queue = MakeUnique<Standard_Queue>(QUEUE_BATCH_SIZE);
+    auto queue = std::make_unique<Standard_Queue>(QUEUE_BATCH_SIZE, SCRIPT_CHECK_THREADS);
     {
-        boost::thread_group tg;
+        std::vector<std::thread> tg;
+        tg.reserve(3);
         std::atomic<int> nThreads {0};
         std::atomic<int> fails {0};
         for (size_t i = 0; i < 3; ++i) {
-            tg.create_thread(
+            tg.emplace_back(
                     [&]{
-                    CCheckQueueControl<FakeCheck> control(queue.get());
+                    CCheckQueueControl<FakeCheck> control(*queue);
                     // While sleeping, no other thread should execute to this point
                     auto observed = ++nThreads;
                     UninterruptibleSleep(std::chrono::milliseconds{10});
                     fails += observed  != nThreads;
                     });
         }
-        tg.join_all();
+        for (auto& thread: tg) {
+            if (thread.joinable()) thread.join();
+        }
         BOOST_REQUIRE_EQUAL(fails, 0);
     }
     {
-        boost::thread_group tg;
+        std::vector<std::thread> tg;
         std::mutex m;
         std::condition_variable cv;
         bool has_lock{false};
@@ -410,8 +387,8 @@ BOOST_AUTO_TEST_CASE(test_CheckQueueControl_Locks)
         bool done_ack{false};
         {
             std::unique_lock<std::mutex> l(m);
-            tg.create_thread([&]{
-                    CCheckQueueControl<FakeCheck> control(queue.get());
+            tg.emplace_back([&]{
+                    CCheckQueueControl<FakeCheck> control(*queue);
                     std::unique_lock<std::mutex> ll(m);
                     has_lock = true;
                     cv.notify_one();
@@ -426,7 +403,7 @@ BOOST_AUTO_TEST_CASE(test_CheckQueueControl_Locks)
             cv.wait(l, [&](){return has_lock;});
             bool fails = false;
             for (auto x = 0; x < 100 && !fails; ++x) {
-                fails = queue->ControlMutex.try_lock();
+                fails = queue->m_control_mutex.try_lock();
             }
             has_tried = true;
             cv.notify_one();
@@ -436,8 +413,9 @@ BOOST_AUTO_TEST_CASE(test_CheckQueueControl_Locks)
             cv.notify_one();
             BOOST_REQUIRE(!fails);
         }
-        tg.join_all();
+        for (auto& thread: tg) {
+            if (thread.joinable()) thread.join();
+        }
     }
 }
 BOOST_AUTO_TEST_SUITE_END()
-

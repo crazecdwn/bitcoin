@@ -1,15 +1,16 @@
-// Copyright (c) 2012-2020 The Bitcoin Core developers
+// Copyright (c) 2012-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <arith_uint256.h>
+#include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <merkleblock.h>
 #include <serialize.h>
 #include <streams.h>
+#include <test/util/common.h>
+#include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
-#include <version.h>
 
 #include <vector>
 
@@ -18,22 +19,26 @@
 class CPartialMerkleTreeTester : public CPartialMerkleTree
 {
 public:
+    CPartialMerkleTreeTester(FastRandomContext& rng) : m_rng{rng} {}
+
     // flip one bit in one of the hashes - this should break the authentication
     void Damage() {
-        unsigned int n = InsecureRandRange(vHash.size());
-        int bit = InsecureRandBits(8);
+        unsigned int n = m_rng.randrange(vHash.size());
+        int bit = m_rng.randbits(8);
         *(vHash[n].begin() + (bit>>3)) ^= 1<<(bit&7);
     }
+
+    FastRandomContext& m_rng;
 };
 
 BOOST_FIXTURE_TEST_SUITE(pmt_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(pmt_test1)
 {
-    static const unsigned int nTxCounts[] = {1, 4, 7, 17, 56, 100, 127, 256, 312, 513, 1000, 4095};
+    static const unsigned int tx_counts[] = {1, 4, 7, 17, 56, 100, 127, 256, 312, 513, 1000, 4095};
 
     for (int i = 0; i < 12; i++) {
-        unsigned int nTx = nTxCounts[i];
+        unsigned int nTx = tx_counts[i];
 
         // build a block with some dummy transactions
         CBlock block;
@@ -45,7 +50,7 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
 
         // calculate actual merkle root and height
         uint256 merkleRoot1 = BlockMerkleRoot(block);
-        std::vector<uint256> vTxid(nTx, uint256());
+        std::vector<Txid> vTxid(nTx);
         for (unsigned int j=0; j<nTx; j++)
             vTxid[j] = block.vtx[j]->GetHash();
         int nHeight = 1, nTx_ = nTx;
@@ -58,9 +63,9 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
         for (int att = 1; att < 15; att++) {
             // build random subset of txid's
             std::vector<bool> vMatch(nTx, false);
-            std::vector<uint256> vMatchTxid1;
+            std::vector<Txid> vMatchTxid1;
             for (unsigned int j=0; j<nTx; j++) {
-                bool fInclude = InsecureRandBits(att / 2) == 0;
+                bool fInclude = m_rng.randbits(att / 2) == 0;
                 vMatch[j] = fInclude;
                 if (fInclude)
                     vMatchTxid1.push_back(vTxid[j]);
@@ -70,7 +75,7 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
             CPartialMerkleTree pmt1(vTxid, vMatch);
 
             // serialize
-            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+            DataStream ss{};
             ss << pmt1;
 
             // verify CPartialMerkleTree's size guarantees
@@ -78,11 +83,11 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
             BOOST_CHECK(ss.size() <= 10 + (258*n+7)/8);
 
             // deserialize into a tester copy
-            CPartialMerkleTreeTester pmt2;
+            CPartialMerkleTreeTester pmt2{m_rng};
             ss >> pmt2;
 
             // extract merkle root and matched txids from copy
-            std::vector<uint256> vMatchTxid2;
+            std::vector<Txid> vMatchTxid2;
             std::vector<unsigned int> vIndex;
             uint256 merkleRoot2 = pmt2.ExtractMatches(vMatchTxid2, vIndex);
 
@@ -97,7 +102,7 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
             for (int j=0; j<4; j++) {
                 CPartialMerkleTreeTester pmt3(pmt2);
                 pmt3.Damage();
-                std::vector<uint256> vMatchTxid3;
+                std::vector<Txid> vMatchTxid3;
                 uint256 merkleRoot3 = pmt3.ExtractMatches(vMatchTxid3, vIndex);
                 BOOST_CHECK(merkleRoot3 != merkleRoot1);
             }
@@ -107,19 +112,57 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
 
 BOOST_AUTO_TEST_CASE(pmt_malleability)
 {
-    std::vector<uint256> vTxid = {
-        ArithToUint256(1), ArithToUint256(2),
-        ArithToUint256(3), ArithToUint256(4),
-        ArithToUint256(5), ArithToUint256(6),
-        ArithToUint256(7), ArithToUint256(8),
-        ArithToUint256(9), ArithToUint256(10),
-        ArithToUint256(9), ArithToUint256(10),
+    std::vector<Txid> vTxid{
+        Txid::FromUint256(uint256{1}), Txid::FromUint256(uint256{2}),
+        Txid::FromUint256(uint256{3}), Txid::FromUint256(uint256{4}),
+        Txid::FromUint256(uint256{5}), Txid::FromUint256(uint256{6}),
+        Txid::FromUint256(uint256{7}), Txid::FromUint256(uint256{8}),
+        Txid::FromUint256(uint256{9}), Txid::FromUint256(uint256{10}),
+        Txid::FromUint256(uint256{9}), Txid::FromUint256(uint256{10}),
     };
     std::vector<bool> vMatch = {false, false, false, false, false, false, false, false, false, true, true, false};
 
     CPartialMerkleTree tree(vTxid, vMatch);
     std::vector<unsigned int> vIndex;
     BOOST_CHECK(tree.ExtractMatches(vTxid, vIndex).IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(pmt_malformed)
+{
+    // Deserialize a partial merkle tree with the given fields and extract its matches.
+    const auto extract{[](uint32_t tx_count, uint32_t hash_count, std::vector<unsigned char> bits) {
+        std::vector<uint256> hashes;
+        for (uint32_t i{1}; i <= hash_count; ++i) hashes.emplace_back(i);
+        DataStream ss;
+        ss << tx_count << hashes << bits;
+        CPartialMerkleTree tree;
+        ss >> tree;
+        std::vector<Txid> matches;
+        std::vector<unsigned int> indexes;
+        return tree.ExtractMatches(matches, indexes);
+    }};
+
+    // The transaction count is limited to MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT.
+    constexpr uint32_t max_tx_count{MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT};
+    static_assert(max_tx_count == 16666);
+    BOOST_CHECK_EQUAL(extract(max_tx_count, 1, {0x00}), uint256{1});
+    BOOST_CHECK(extract(max_tx_count + 1, 1, {0x00}).IsNull());
+    // An empty tree, more hashes than transactions, and fewer bits than hashes are
+    // rejected before traversal. Traversal would reject each of them anyway, so these
+    // check the result, not the early returns.
+    BOOST_CHECK(extract(0, 0, {0x00}).IsNull());
+    BOOST_CHECK(extract(1, 2, {0x00}).IsNull());
+    BOOST_CHECK(extract(9, 9, {0xff}).IsNull());
+    // Traversal runs out of hashes: the root is a parent of a match, so both of its
+    // leaves need a hash, but only one is provided.
+    BOOST_CHECK(extract(2, 1, {0x01}).IsNull());
+    // Traversal runs out of bits: eight bits reach the third leaf but not the fourth.
+    BOOST_CHECK(extract(16, 8, {0xff}).IsNull());
+    // Not all bits are consumed: a second byte of bits is more than padding.
+    BOOST_CHECK(extract(1, 1, {0x00, 0x00}).IsNull());
+    // Not all hashes are consumed: the root is not a parent of a match, so only its
+    // own hash is used.
+    BOOST_CHECK(extract(2, 2, {0x00}).IsNull());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

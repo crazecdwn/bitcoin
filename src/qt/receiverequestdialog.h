@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2019 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -29,12 +29,11 @@ public:
 private Q_SLOTS:
     void on_btnCopyURI_clicked();
     void on_btnCopyAddress_clicked();
-
-    void update();
+    void updateDisplayUnit();
 
 private:
     Ui::ReceiveRequestDialog *ui;
-    WalletModel *model;
+    WalletModel* model{nullptr};
     SendCoinsRecipient info;
 };
 

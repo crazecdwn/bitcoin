@@ -1,23 +1,49 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2019 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_RPC_PROTOCOL_H
 #define BITCOIN_RPC_PROTOCOL_H
 
+#include <string_view>
+
 //! HTTP status codes
-enum HTTPStatusCode
+enum HTTPStatusCode : int
 {
     HTTP_OK                    = 200,
+    HTTP_NO_CONTENT            = 204,
     HTTP_BAD_REQUEST           = 400,
     HTTP_UNAUTHORIZED          = 401,
     HTTP_FORBIDDEN             = 403,
     HTTP_NOT_FOUND             = 404,
     HTTP_BAD_METHOD            = 405,
+    HTTP_CONTENT_TOO_LARGE     = 413,
     HTTP_INTERNAL_SERVER_ERROR = 500,
     HTTP_SERVICE_UNAVAILABLE   = 503,
 };
+
+//! Mapping of HTTP status codes to short string explanation.
+//! Copied from libevent http.c success_phrases[] and client_error_phrases[]
+inline std::string_view HTTPStatusReasonString(HTTPStatusCode code)
+{
+    switch (code) {
+    case HTTP_OK: return "OK";
+    case HTTP_NO_CONTENT: return "No Content";
+    case HTTP_BAD_REQUEST: return "Bad Request";
+    case HTTP_UNAUTHORIZED: return "Unauthorized";
+    case HTTP_FORBIDDEN: return "Forbidden";
+    case HTTP_NOT_FOUND: return "Not Found";
+    case HTTP_BAD_METHOD: return "Method Not Allowed";
+    case HTTP_CONTENT_TOO_LARGE: return "Content too large";
+    case HTTP_INTERNAL_SERVER_ERROR: return "Internal Server Error";
+    case HTTP_SERVICE_UNAVAILABLE: return "Service Unavailable";
+    }
+
+    // Reason phrases are optional and may be replaced by local variants.
+    // https://httpwg.org/specs/rfc9110.html#rfc.section.15.1
+    return "";
+}
 
 //! Bitcoin RPC error codes
 enum RPCErrorCode
@@ -45,14 +71,14 @@ enum RPCErrorCode
     RPC_DESERIALIZATION_ERROR       = -22, //!< Error parsing or validating structure in raw format
     RPC_VERIFY_ERROR                = -25, //!< General error during transaction or block submission
     RPC_VERIFY_REJECTED             = -26, //!< Transaction or block was rejected by network rules
-    RPC_VERIFY_ALREADY_IN_CHAIN     = -27, //!< Transaction already in chain
+    RPC_VERIFY_ALREADY_IN_UTXO_SET  = -27, //!< Transaction already in utxo set
     RPC_IN_WARMUP                   = -28, //!< Client still warming up
     RPC_METHOD_DEPRECATED           = -32, //!< RPC method is deprecated
+    RPC_LIMIT_EXCEEDED              = -37, //!< A bounded resource is currently at capacity
 
     //! Aliases for backward compatibility
     RPC_TRANSACTION_ERROR           = RPC_VERIFY_ERROR,
     RPC_TRANSACTION_REJECTED        = RPC_VERIFY_REJECTED,
-    RPC_TRANSACTION_ALREADY_IN_CHAIN= RPC_VERIFY_ALREADY_IN_CHAIN,
 
     //! P2P client errors
     RPC_CLIENT_NOT_CONNECTED        = -9,  //!< Bitcoin is not connected
@@ -62,6 +88,7 @@ enum RPCErrorCode
     RPC_CLIENT_NODE_NOT_CONNECTED   = -29, //!< Node to disconnect not found in connected nodes
     RPC_CLIENT_INVALID_IP_OR_SUBNET = -30, //!< Invalid IP/Subnet
     RPC_CLIENT_P2P_DISABLED         = -31, //!< No valid connection manager instance found
+    RPC_CLIENT_NODE_CAPACITY_REACHED= -34, //!< Max number of outbound or block-relay connections already open
 
     //! Chain errors
     RPC_CLIENT_MEMPOOL_DISABLED     = -33, //!< No mempool instance found
@@ -78,6 +105,8 @@ enum RPCErrorCode
     RPC_WALLET_ALREADY_UNLOCKED     = -17, //!< Wallet is already unlocked
     RPC_WALLET_NOT_FOUND            = -18, //!< Invalid wallet specified
     RPC_WALLET_NOT_SPECIFIED        = -19, //!< No wallet specified (error when there are multiple wallets loaded)
+    RPC_WALLET_ALREADY_LOADED       = -35, //!< This same wallet is already loaded
+    RPC_WALLET_ALREADY_EXISTS       = -36, //!< There is already a wallet with the same name
 
     //! Backwards compatible aliases
     RPC_WALLET_INVALID_ACCOUNT_NAME = RPC_WALLET_INVALID_LABEL_NAME,

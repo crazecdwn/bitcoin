@@ -35,16 +35,18 @@ it will use a special cookie file for authentication. The cookie is generated wi
 content when the daemon starts, and deleted when it exits. Read access to this file
 controls who can access it through RPC.
 
-By default the cookie is stored in the data directory, but it's location can be overridden
-with the option '-rpccookiefile'.
+By default the cookie is stored in the data directory, but its location can be
+overridden with the option `-rpccookiefile`. Default file permissions for the
+cookie are "owner" (i.e. user read/writeable) via default application-wide file
+umask of `0077`, but these can be overridden with the `-rpccookieperms` option.
 
 This allows for running bitcoind without having to do any manual configuration.
 
 `conf`, `pid`, and `wallet` accept relative paths which are interpreted as
 relative to the data directory. `wallet` *only* supports relative paths.
 
-For an example configuration file that describes the configuration settings,
-see `share/examples/bitcoin.conf`.
+To generate an example configuration file that describes the configuration settings,
+see [contrib/devtools/README.md](../contrib/devtools/README.md#gen-bitcoin-confsh).
 
 Paths
 ---------------------------------
@@ -53,11 +55,12 @@ Paths
 
 All three configurations assume several paths that might need to be adjusted.
 
-Binary:              `/usr/bin/bitcoind`
-Configuration file:  `/etc/bitcoin/bitcoin.conf`
-Data directory:      `/var/lib/bitcoind`
-PID file:            `/var/run/bitcoind/bitcoind.pid` (OpenRC and Upstart) or `/run/bitcoind/bitcoind.pid` (systemd)
-Lock file:           `/var/lock/subsys/bitcoind` (CentOS)
+    Binary:              /usr/bin/bitcoind
+    Configuration file:  /etc/bitcoin/bitcoin.conf
+    Data directory:      /var/lib/bitcoind
+    PID file:            /var/run/bitcoind/bitcoind.pid (OpenRC and Upstart) or
+                         /run/bitcoind/bitcoind.pid (systemd)
+    Lock file:           /var/lock/subsys/bitcoind (CentOS)
 
 The PID directory (if applicable) and data directory should both be owned by the
 bitcoin user and group. It is advised for security reasons to make the
@@ -69,7 +72,7 @@ NOTE: When using the systemd .service file, the creation of the aforementioned
 directories and the setting of their permissions is automatically handled by
 systemd. Directories are given a permission of 710, giving the bitcoin group
 access to files under it _if_ the files themselves give permission to the
-bitcoin group to do so (e.g. when `-sysperms` is specified). This does not allow
+bitcoin group to do so. This does not allow
 for the listing of files under the directory.
 
 NOTE: It is not currently possible to override `datadir` in
@@ -83,10 +86,10 @@ OpenRC).
 
 ### macOS
 
-Binary:              `/usr/local/bin/bitcoind`
-Configuration file:  `~/Library/Application Support/Bitcoin/bitcoin.conf`
-Data directory:      `~/Library/Application Support/Bitcoin`
-Lock file:           `~/Library/Application Support/Bitcoin/.lock`
+    Binary:              /usr/local/bin/bitcoind
+    Configuration file:  ~/Library/Application Support/Bitcoin/bitcoin.conf
+    Data directory:      ~/Library/Application Support/Bitcoin
+    Lock file:           ~/Library/Application Support/Bitcoin/.lock
 
 Installing Service Configuration
 -----------------------------------

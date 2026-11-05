@@ -1,24 +1,26 @@
-// Copyright (c) 2020 The Bitcoin Core developers
+// Copyright (c) 2020-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
-#include <script/standard.h>
+#include <test/util/common.h>
 #include <test/util/setup_common.h>
+#include <script/solver.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
 using interfaces::FoundBlock;
 
-BOOST_FIXTURE_TEST_SUITE(interfaces_tests, TestChain100Setup)
+BOOST_AUTO_TEST_SUITE(interfaces_tests)
 
-BOOST_AUTO_TEST_CASE(findBlock)
+BOOST_FIXTURE_TEST_CASE(findBlock, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    LOCK(Assert(m_node.chainman)->GetMutex());
+    auto& chain = m_node.chain;
+    const CChain& active = Assert(m_node.chainman)->ActiveChain();
 
     uint256 hash;
     BOOST_CHECK(chain->findBlock(active[10]->GetBlockHash(), FoundBlock().hash(hash)));
@@ -44,13 +46,26 @@ BOOST_AUTO_TEST_CASE(findBlock)
     BOOST_CHECK(chain->findBlock(active[60]->GetBlockHash(), FoundBlock().mtpTime(mtp_time)));
     BOOST_CHECK_EQUAL(mtp_time, active[60]->GetMedianTimePast());
 
+    bool cur_active{false}, next_active{false};
+    uint256 next_hash;
+    BOOST_CHECK_EQUAL(active.Height(), 100);
+    BOOST_CHECK(chain->findBlock(active[99]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active).hash(next_hash))));
+    BOOST_CHECK(cur_active);
+    BOOST_CHECK(next_active);
+    BOOST_CHECK_EQUAL(next_hash, active[100]->GetBlockHash());
+    cur_active = next_active = false;
+    BOOST_CHECK(chain->findBlock(active[100]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active))));
+    BOOST_CHECK(cur_active);
+    BOOST_CHECK(!next_active);
+
     BOOST_CHECK(!chain->findBlock({}, FoundBlock()));
 }
 
-BOOST_AUTO_TEST_CASE(findFirstBlockWithTimeAndHeight)
+BOOST_FIXTURE_TEST_CASE(findFirstBlockWithTimeAndHeight, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    LOCK(Assert(m_node.chainman)->GetMutex());
+    auto& chain = m_node.chain;
+    const CChain& active = Assert(m_node.chainman)->ActiveChain();
     uint256 hash;
     int height;
     BOOST_CHECK(chain->findFirstBlockWithTimeAndHeight(/* min_time= */ 0, /* min_height= */ 5, FoundBlock().hash(hash).height(height)));
@@ -59,49 +74,36 @@ BOOST_AUTO_TEST_CASE(findFirstBlockWithTimeAndHeight)
     BOOST_CHECK(!chain->findFirstBlockWithTimeAndHeight(/* min_time= */ active.Tip()->GetBlockTimeMax() + 1, /* min_height= */ 0));
 }
 
-BOOST_AUTO_TEST_CASE(findNextBlock)
+BOOST_FIXTURE_TEST_CASE(findAncestorByHeight, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
-    bool reorg;
-    uint256 hash;
-    BOOST_CHECK(chain->findNextBlock(active[20]->GetBlockHash(), 20, FoundBlock().hash(hash), &reorg));
-    BOOST_CHECK_EQUAL(hash, active[21]->GetBlockHash());
-    BOOST_CHECK_EQUAL(reorg, false);
-    BOOST_CHECK(!chain->findNextBlock(uint256(), 20, {}, &reorg));
-    BOOST_CHECK_EQUAL(reorg, true);
-    BOOST_CHECK(!chain->findNextBlock(active.Tip()->GetBlockHash(), active.Height(), {}, &reorg));
-    BOOST_CHECK_EQUAL(reorg, false);
-}
-
-BOOST_AUTO_TEST_CASE(findAncestorByHeight)
-{
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    LOCK(Assert(m_node.chainman)->GetMutex());
+    auto& chain = m_node.chain;
+    const CChain& active = Assert(m_node.chainman)->ActiveChain();
     uint256 hash;
     BOOST_CHECK(chain->findAncestorByHeight(active[20]->GetBlockHash(), 10, FoundBlock().hash(hash)));
     BOOST_CHECK_EQUAL(hash, active[10]->GetBlockHash());
     BOOST_CHECK(!chain->findAncestorByHeight(active[10]->GetBlockHash(), 20));
 }
 
-BOOST_AUTO_TEST_CASE(findAncestorByHash)
+BOOST_FIXTURE_TEST_CASE(findAncestorByHash, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    LOCK(Assert(m_node.chainman)->GetMutex());
+    auto& chain = m_node.chain;
+    const CChain& active = Assert(m_node.chainman)->ActiveChain();
     int height = -1;
     BOOST_CHECK(chain->findAncestorByHash(active[20]->GetBlockHash(), active[10]->GetBlockHash(), FoundBlock().height(height)));
     BOOST_CHECK_EQUAL(height, 10);
     BOOST_CHECK(!chain->findAncestorByHash(active[10]->GetBlockHash(), active[20]->GetBlockHash()));
 }
 
-BOOST_AUTO_TEST_CASE(findCommonAncestor)
+BOOST_FIXTURE_TEST_CASE(findCommonAncestor, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    auto& chain = m_node.chain;
+    const CChain& active{*WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return &Assert(m_node.chainman)->ActiveChain())};
     auto* orig_tip = active.Tip();
     for (int i = 0; i < 10; ++i) {
         BlockValidationState state;
-        ChainstateActive().InvalidateBlock(state, Params(), active.Tip());
+        m_node.chainman->ActiveChainstate().InvalidateBlock(state, active.Tip());
     }
     BOOST_CHECK_EQUAL(active.Height(), orig_tip->nHeight - 10);
     coinbaseKey.MakeNewKey(true);
@@ -124,10 +126,11 @@ BOOST_AUTO_TEST_CASE(findCommonAncestor)
     BOOST_CHECK_EQUAL(orig_hash, orig_tip->GetBlockHash());
 }
 
-BOOST_AUTO_TEST_CASE(hasBlocks)
+BOOST_FIXTURE_TEST_CASE(hasBlocks, TestChain100Setup)
 {
-    auto chain = interfaces::MakeChain(m_node);
-    auto& active = ChainActive();
+    LOCK(::cs_main);
+    auto& chain = m_node.chain;
+    const CChain& active = Assert(m_node.chainman)->ActiveChain();
 
     // Test ranges
     BOOST_CHECK(chain->hasBlocks(active.Tip()->GetBlockHash(), 10, 90));

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020 The Bitcoin Core developers
+// Copyright (c) 2019-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -11,20 +11,31 @@
 #include <qt/guiutil.h>
 #include <qt/walletmodel.h>
 
+#include <external_signer.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <util/string.h>
+#include <util/threadnames.h>
 #include <util/translation.h>
 #include <wallet/wallet.h>
 
 #include <algorithm>
+#include <chrono>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QMessageBox>
+#include <QMetaObject>
 #include <QMutexLocker>
 #include <QThread>
 #include <QTimer>
 #include <QWindow>
+
+using util::Join;
+using wallet::WALLET_FLAG_BLANK_WALLET;
+using wallet::WALLET_FLAG_DESCRIPTORS;
+using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
+using wallet::WALLET_FLAG_EXTERNAL_SIGNER;
 
 WalletController::WalletController(ClientModel& client_model, const PlatformStyle* platform_style, QObject* parent)
     : QObject(parent)
@@ -33,18 +44,16 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
     , m_client_model(client_model)
     , m_node(client_model.node())
     , m_platform_style(platform_style)
-    , m_options_model(client_model.getOptionsModel())
 {
-    m_handler_load_wallet = m_node.handleLoadWallet([this](std::unique_ptr<interfaces::Wallet> wallet) {
+    m_handler_load_wallet = m_node.walletLoader().handleLoadWallet([this](std::unique_ptr<interfaces::Wallet> wallet) {
         getOrCreateWallet(std::move(wallet));
     });
 
-    for (std::unique_ptr<interfaces::Wallet>& wallet : m_node.getWallets()) {
-        getOrCreateWallet(std::move(wallet));
-    }
-
     m_activity_worker->moveToThread(m_activity_thread);
     m_activity_thread->start();
+    QTimer::singleShot(0, m_activity_worker, []() {
+        util::ThreadRename("qt-walletctrl");
+    });
 }
 
 // Not using the default destructor because not all member types definitions are
@@ -56,24 +65,26 @@ WalletController::~WalletController()
     delete m_activity_worker;
 }
 
-std::vector<WalletModel*> WalletController::getOpenWallets() const
+std::map<std::string, std::pair<bool, std::string>> WalletController::listWalletDir() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_wallets;
-}
-
-std::map<std::string, bool> WalletController::listWalletDir() const
-{
-    QMutexLocker locker(&m_mutex);
-    std::map<std::string, bool> wallets;
-    for (const std::string& name : m_node.listWalletDir()) {
-        wallets[name] = false;
+    std::map<std::string, std::pair<bool, std::string>> wallets;
+    for (const auto& [name, format] : m_node.walletLoader().listWalletDir()) {
+        wallets[name] = std::make_pair(false, format);
     }
     for (WalletModel* wallet_model : m_wallets) {
         auto it = wallets.find(wallet_model->wallet().getWalletName());
-        if (it != wallets.end()) it->second = true;
+        if (it != wallets.end()) it->second.first = true;
     }
     return wallets;
+}
+
+void WalletController::removeWallet(WalletModel* wallet_model)
+{
+    // Once the wallet is successfully removed from the node, the model will emit the 'WalletModel::unload' signal.
+    // This signal is already connected and will complete the removal of the view from the GUI.
+    // Look at 'WalletController::getOrCreateWallet' for the signal connection.
+    wallet_model->wallet().remove();
 }
 
 void WalletController::closeWallet(WalletModel* wallet_model, QWidget* parent)
@@ -86,10 +97,21 @@ void WalletController::closeWallet(WalletModel* wallet_model, QWidget* parent)
     box.setDefaultButton(QMessageBox::Yes);
     if (box.exec() != QMessageBox::Yes) return;
 
-    // First remove wallet from node.
-    wallet_model->wallet().remove();
-    // Now release the model.
-    removeAndDeleteWallet(wallet_model);
+    removeWallet(wallet_model);
+}
+
+void WalletController::closeAllWallets(QWidget* parent)
+{
+    QMessageBox::StandardButton button = QMessageBox::question(parent, tr("Close all wallets"),
+        tr("Are you sure you wish to close all wallets?"),
+        QMessageBox::Yes|QMessageBox::Cancel,
+        QMessageBox::Yes);
+    if (button != QMessageBox::Yes) return;
+
+    QMutexLocker locker(&m_mutex);
+    for (WalletModel* wallet_model : m_wallets) {
+        removeWallet(wallet_model);
+    }
 }
 
 WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet)
@@ -107,10 +129,20 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     }
 
     // Instantiate model and register it.
-    WalletModel* wallet_model = new WalletModel(std::move(wallet), m_client_model, m_platform_style, nullptr);
-    // Handler callback runs in a different thread so fix wallet model thread affinity.
+    WalletModel* wallet_model = new WalletModel(std::move(wallet), m_client_model, m_platform_style,
+                                                nullptr /* required for the following moveToThread() call */);
+
+    // Move WalletModel object to the thread that created the WalletController
+    // object (GUI main thread), instead of the current thread, which could be
+    // an outside wallet thread or RPC thread sending a LoadWallet notification.
+    // This ensures queued signals sent to the WalletModel object will be
+    // handled on the GUI event loop.
     wallet_model->moveToThread(thread());
-    wallet_model->setParent(this);
+    // setParent(parent) must be called in the thread which created the parent object. More details in #18948.
+    QMetaObject::invokeMethod(this, [wallet_model, this] {
+        wallet_model->setParent(this);
+    }, GUIUtil::blockingGUIThreadConnection());
+
     m_wallets.push_back(wallet_model);
 
     // WalletModel::startPollBalance needs to be called in a thread managed by
@@ -120,9 +152,10 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     assert(called);
 
     connect(wallet_model, &WalletModel::unload, this, [this, wallet_model] {
-        // Defer removeAndDeleteWallet when no modal widget is active.
-        // TODO: remove this workaround by removing usage of QDiallog::exec.
-        if (QApplication::activeModalWidget()) {
+        // Defer removeAndDeleteWallet when no modal widget is actively waiting for an action.
+        // TODO: remove this workaround by removing usage of QDialog::exec.
+        QWidget* active_dialog = QApplication::activeModalWidget();
+        if (active_dialog && dynamic_cast<QProgressDialog*>(active_dialog) == nullptr) {
             connect(qApp, &QApplication::focusWindowChanged, wallet_model, [this, wallet_model]() {
                 if (!QApplication::activeModalWidget()) {
                     removeAndDeleteWallet(wallet_model);
@@ -136,7 +169,6 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     // Re-emit coinsSent signal from wallet model.
     connect(wallet_model, &WalletModel::coinsSent, this, &WalletController::coinsSent);
 
-    // Notify walletAdded signal on the GUI thread.
     Q_EMIT walletAdded(wallet_model);
 
     return wallet_model;
@@ -147,7 +179,7 @@ void WalletController::removeAndDeleteWallet(WalletModel* wallet_model)
     // Unregister wallet model.
     {
         QMutexLocker locker(&m_mutex);
-        m_wallets.erase(std::remove(m_wallets.begin(), m_wallets.end(), wallet_model));
+        std::erase(m_wallets, wallet_model);
     }
     Q_EMIT walletRemoved(wallet_model);
     // Currently this can trigger the unload since the model can hold the last
@@ -160,30 +192,26 @@ WalletControllerActivity::WalletControllerActivity(WalletController* wallet_cont
     , m_wallet_controller(wallet_controller)
     , m_parent_widget(parent_widget)
 {
+    connect(this, &WalletControllerActivity::finished, this, &QObject::deleteLater);
 }
 
-WalletControllerActivity::~WalletControllerActivity()
+void WalletControllerActivity::showProgressDialog(const QString& title_text, const QString& label_text, bool show_minimized)
 {
-    delete m_progress_dialog;
-}
+    auto progress_dialog = new QProgressDialog(m_parent_widget);
+    progress_dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(this, &WalletControllerActivity::finished, progress_dialog, &QWidget::close);
 
-void WalletControllerActivity::showProgressDialog(const QString& label_text)
-{
-    assert(!m_progress_dialog);
-    m_progress_dialog = new QProgressDialog(m_parent_widget);
-
-    m_progress_dialog->setLabelText(label_text);
-    m_progress_dialog->setRange(0, 0);
-    m_progress_dialog->setCancelButton(nullptr);
-    m_progress_dialog->setWindowModality(Qt::ApplicationModal);
-    GUIUtil::PolishProgressDialog(m_progress_dialog);
-}
-
-void WalletControllerActivity::destroyProgressDialog()
-{
-    assert(m_progress_dialog);
-    delete m_progress_dialog;
-    m_progress_dialog = nullptr;
+    progress_dialog->setWindowTitle(title_text);
+    progress_dialog->setLabelText(label_text);
+    progress_dialog->setRange(0, 0);
+    progress_dialog->setCancelButton(nullptr);
+    progress_dialog->setWindowModality(Qt::ApplicationModal);
+    GUIUtil::PolishProgressDialog(progress_dialog);
+    // The setValue call forces QProgressDialog to start the internal duration estimation.
+    // See details in https://bugreports.qt.io/browse/QTBUG-47042.
+    progress_dialog->setValue(0);
+    // When requested, launch dialog minimized
+    if (show_minimized) progress_dialog->showMinimized();
 }
 
 CreateWalletActivity::CreateWalletActivity(WalletController* wallet_controller, QWidget* parent_widget)
@@ -217,38 +245,46 @@ void CreateWalletActivity::askPassphrase()
 
 void CreateWalletActivity::createWallet()
 {
-    showProgressDialog(tr("Creating Wallet <b>%1</b>...").arg(m_create_wallet_dialog->walletName().toHtmlEscaped()));
+    showProgressDialog(
+        //: Title of window indicating the progress of creation of a new wallet.
+        tr("Create Wallet"),
+        /*: Descriptive text of the create wallet progress window which indicates
+            to the user which wallet is currently being created. */
+        tr("Creating Wallet <b>%1</b>…").arg(m_create_wallet_dialog->walletName().toHtmlEscaped()));
 
     std::string name = m_create_wallet_dialog->walletName().toStdString();
     uint64_t flags = 0;
+    // Enable descriptors by default.
+    flags |= WALLET_FLAG_DESCRIPTORS;
     if (m_create_wallet_dialog->isDisablePrivateKeysChecked()) {
         flags |= WALLET_FLAG_DISABLE_PRIVATE_KEYS;
     }
     if (m_create_wallet_dialog->isMakeBlankWalletChecked()) {
         flags |= WALLET_FLAG_BLANK_WALLET;
     }
-    if (m_create_wallet_dialog->isDescriptorWalletChecked()) {
-        flags |= WALLET_FLAG_DESCRIPTORS;
+    if (m_create_wallet_dialog->isExternalSignerChecked()) {
+        flags |= WALLET_FLAG_EXTERNAL_SIGNER;
     }
 
-    QTimer::singleShot(500, worker(), [this, name, flags] {
-        WalletCreationStatus status;
-        std::unique_ptr<interfaces::Wallet> wallet = node().createWallet(m_passphrase, flags, name, m_error_message, m_warning_message, status);
+    QTimer::singleShot(500ms, worker(), [this, name, flags] {
+        auto wallet{node().walletLoader().createWallet(name, m_passphrase, flags, m_warning_message)};
 
-        if (status == WalletCreationStatus::SUCCESS) m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(wallet));
+        if (wallet) {
+            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*wallet));
+        } else {
+            m_error_message = util::ErrorString(wallet);
+        }
 
-        QTimer::singleShot(500, this, &CreateWalletActivity::finish);
+        QTimer::singleShot(500ms, this, &CreateWalletActivity::finish);
     });
 }
 
 void CreateWalletActivity::finish()
 {
-    destroyProgressDialog();
-
-    if (!m_error_message.original.empty()) {
+    if (!m_error_message.empty()) {
         QMessageBox::critical(m_parent_widget, tr("Create wallet failed"), QString::fromStdString(m_error_message.translated));
     } else if (!m_warning_message.empty()) {
-        QMessageBox::warning(m_parent_widget, tr("Create wallet warning"), QString::fromStdString(Join(m_warning_message, "\n", OpTranslated)));
+        QMessageBox::warning(m_parent_widget, tr("Create wallet warning"), QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
     }
 
     if (m_wallet_model) Q_EMIT created(m_wallet_model);
@@ -259,6 +295,19 @@ void CreateWalletActivity::finish()
 void CreateWalletActivity::create()
 {
     m_create_wallet_dialog = new CreateWalletDialog(m_parent_widget);
+
+    std::vector<std::unique_ptr<interfaces::ExternalSigner>> signers;
+    try {
+        signers = node().listExternalSigners();
+    } catch (const std::runtime_error& e) {
+        QMessageBox::critical(nullptr, tr("Can't list signers"), e.what());
+    }
+    if (signers.size() > 1) {
+        QMessageBox::critical(nullptr, tr("Too many external signers found"), QString::fromStdString("More than one external signer found. Please connect only one at a time."));
+        signers.clear();
+    }
+    m_create_wallet_dialog->setSigners(signers);
+
     m_create_wallet_dialog->setWindowModality(Qt::ApplicationModal);
     m_create_wallet_dialog->show();
 
@@ -284,12 +333,10 @@ OpenWalletActivity::OpenWalletActivity(WalletController* wallet_controller, QWid
 
 void OpenWalletActivity::finish()
 {
-    destroyProgressDialog();
-
-    if (!m_error_message.original.empty()) {
+    if (!m_error_message.empty()) {
         QMessageBox::critical(m_parent_widget, tr("Open wallet failed"), QString::fromStdString(m_error_message.translated));
     } else if (!m_warning_message.empty()) {
-        QMessageBox::warning(m_parent_widget, tr("Open wallet warning"), QString::fromStdString(Join(m_warning_message, "\n", OpTranslated)));
+        QMessageBox::warning(m_parent_widget, tr("Open wallet warning"), QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
     }
 
     if (m_wallet_model) Q_EMIT opened(m_wallet_model);
@@ -299,15 +346,206 @@ void OpenWalletActivity::finish()
 
 void OpenWalletActivity::open(const std::string& path)
 {
-    QString name = path.empty() ? QString("["+tr("default wallet")+"]") : QString::fromStdString(path);
+    QString name = GUIUtil::WalletDisplayName(path);
 
-    showProgressDialog(tr("Opening Wallet <b>%1</b>...").arg(name.toHtmlEscaped()));
+    showProgressDialog(
+        //: Title of window indicating the progress of opening of a wallet.
+        tr("Open Wallet"),
+        /*: Descriptive text of the open wallet progress window which indicates
+            to the user which wallet is currently being opened. */
+        tr("Opening Wallet <b>%1</b>…").arg(name.toHtmlEscaped()));
 
     QTimer::singleShot(0, worker(), [this, path] {
-        std::unique_ptr<interfaces::Wallet> wallet = node().loadWallet(path, m_error_message, m_warning_message);
+        auto wallet{node().walletLoader().loadWallet(path, m_warning_message)};
 
-        if (wallet) m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(wallet));
+        if (wallet) {
+            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*wallet));
+        } else {
+            m_error_message = util::ErrorString(wallet);
+        }
 
         QTimer::singleShot(0, this, &OpenWalletActivity::finish);
     });
+}
+
+LoadWalletsActivity::LoadWalletsActivity(WalletController* wallet_controller, QWidget* parent_widget)
+    : WalletControllerActivity(wallet_controller, parent_widget)
+{
+}
+
+void LoadWalletsActivity::load(bool show_loading_minimized)
+{
+    showProgressDialog(
+        //: Title of progress window which is displayed when wallets are being loaded.
+        tr("Load Wallets"),
+        /*: Descriptive text of the load wallets progress window which indicates to
+            the user that wallets are currently being loaded.*/
+        tr("Loading wallets…"),
+        /*show_minimized=*/show_loading_minimized);
+
+    QTimer::singleShot(0, worker(), [this] {
+        for (auto& wallet : node().walletLoader().getWallets()) {
+            m_wallet_controller->getOrCreateWallet(std::move(wallet));
+        }
+
+        QTimer::singleShot(0, this, [this] { Q_EMIT finished(); });
+    });
+}
+
+RestoreWalletActivity::RestoreWalletActivity(WalletController* wallet_controller, QWidget* parent_widget)
+    : WalletControllerActivity(wallet_controller, parent_widget)
+{
+}
+
+void RestoreWalletActivity::restore(const fs::path& backup_file, const std::string& wallet_name)
+{
+    QString name = QString::fromStdString(wallet_name);
+
+    showProgressDialog(
+        //: Title of progress window which is displayed when wallets are being restored.
+        tr("Restore Wallet"),
+        /*: Descriptive text of the restore wallets progress window which indicates to
+            the user that wallets are currently being restored.*/
+        tr("Restoring Wallet <b>%1</b>…").arg(name.toHtmlEscaped()));
+
+    QTimer::singleShot(0, worker(), [this, backup_file, wallet_name] {
+        auto wallet{node().walletLoader().restoreWallet(backup_file, wallet_name, m_warning_message, /*load_after_restore=*/true)};
+
+        if (wallet) {
+            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*wallet));
+        } else {
+            m_error_message = util::ErrorString(wallet);
+        }
+
+        QTimer::singleShot(0, this, &RestoreWalletActivity::finish);
+    });
+}
+
+void RestoreWalletActivity::finish()
+{
+    if (!m_error_message.empty()) {
+        //: Title of message box which is displayed when the wallet could not be restored.
+        QMessageBox::critical(m_parent_widget, tr("Restore wallet failed"), QString::fromStdString(m_error_message.translated));
+    } else if (!m_warning_message.empty()) {
+        //: Title of message box which is displayed when the wallet is restored with some warning.
+        QMessageBox::warning(m_parent_widget, tr("Restore wallet warning"), QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
+    } else {
+        //: Title of message box which is displayed when the wallet is successfully restored.
+        QMessageBox::information(m_parent_widget, tr("Restore wallet message"), QString::fromStdString(Untranslated("Wallet restored successfully \n").translated));
+    }
+
+    if (m_wallet_model) Q_EMIT restored(m_wallet_model);
+
+    Q_EMIT finished();
+}
+
+void MigrateWalletActivity::do_migrate(const std::string& name, bool load_wallet)
+{
+    SecureString passphrase;
+    if (node().walletLoader().isEncrypted(name)) {
+        // Get the passphrase for the wallet
+        AskPassphraseDialog dlg(AskPassphraseDialog::UnlockMigration, m_parent_widget, &passphrase);
+        if (dlg.exec() == QDialog::Rejected) return;
+    }
+
+    showProgressDialog(tr("Migrate Wallet"), tr("Migrating Wallet <b>%1</b>…").arg(GUIUtil::HtmlEscape(name)));
+
+    QTimer::singleShot(0, worker(), [this, name, passphrase, load_wallet] {
+        auto res{node().walletLoader().migrateWallet(name, passphrase, load_wallet)};
+
+        if (res) {
+            m_success_message = tr("The wallet '%1' was migrated successfully.").arg(GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(name)));
+            if (res->watchonly_wallet_name) {
+                m_success_message += QChar(' ') + tr("Watchonly scripts have been migrated to a new wallet named '%1'.").arg(GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(res->watchonly_wallet_name.value())));
+            }
+            if (res->solvables_wallet_name) {
+                m_success_message += QChar(' ') + tr("Solvable but not watched scripts have been migrated to a new wallet named '%1'.").arg(GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(res->solvables_wallet_name.value())));
+            }
+            if (load_wallet) {
+                assert(res->wallet);
+                m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(res->wallet));
+            } else {
+                m_success_message += QChar(' ') + tr("The wallet was not loaded after migration. You can open it from the \"File > Open wallet\" menu.");
+            }
+        } else {
+            m_error_message = util::ErrorString(res);
+        }
+
+        QTimer::singleShot(0, this, &MigrateWalletActivity::finish);
+    });
+}
+
+void MigrateWalletActivity::migrate(const std::string& name)
+{
+    // Warn the user about migration
+    QMessageBox box(m_parent_widget);
+    box.setWindowTitle(tr("Migrate wallet"));
+    box.setText(tr("Are you sure you wish to migrate the wallet <i>%1</i>?").arg(GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(name))));
+    box.setInformativeText(tr("Migrating the wallet will convert this wallet to one or more descriptor wallets. A new wallet backup will need to be made.\n"
+                "If this wallet contains any watchonly scripts, a new wallet will be created which contains those watchonly scripts.\n"
+                "If this wallet contains any solvable but not watched scripts, a different and new wallet will be created which contains those scripts.\n\n"
+                "The migration process will create a backup of the wallet before migrating. This backup file will be named "
+                "<wallet name>-<timestamp>.legacy.bak and can be found in the directory for this wallet. In the event of "
+                "an incorrect migration, the backup can be restored with the \"Restore Wallet\" functionality."));
+    auto* load_wallet_checkbox = new QCheckBox(tr("Load wallet after migration"), &box);
+    load_wallet_checkbox->setToolTip(tr("If the node is pruned and the wallet was created before the pruned height, the migration process may fail trying to load the migrated wallet."));
+    load_wallet_checkbox->setChecked(true);
+    box.setCheckBox(load_wallet_checkbox);
+    box.setStandardButtons(QMessageBox::Yes|QMessageBox::Cancel);
+    box.setDefaultButton(QMessageBox::Yes);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    do_migrate(name, load_wallet_checkbox->isChecked());
+}
+
+void MigrateWalletActivity::restore_and_migrate(const fs::path& path, const std::string& wallet_name)
+{
+    // Warn the user about migration
+    QMessageBox box(m_parent_widget);
+    box.setWindowTitle(tr("Restore and Migrate wallet"));
+    box.setText(tr("Are you sure you wish to restore the wallet file <i>%1</i> to <i>%2</i> and migrate it?").arg(GUIUtil::HtmlEscape(fs::PathToString(path)), GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(wallet_name))));
+    box.setInformativeText(tr("Restoring the wallet will copy the backup file to the wallets directory and place it in the standard "
+                "wallet directory layout. The original file will not be modified.\n\n"
+                "Migrating the wallet will convert the restored wallet to one or more descriptor wallets. A new wallet backup will need to be made.\n"
+                "If this wallet contains any watchonly scripts, a new wallet will be created which contains those watchonly scripts.\n"
+                "If this wallet contains any solvable but not watched scripts, a different and new wallet will be created which contains those scripts.\n\n"
+                "The migration process will create a backup of the wallet before migrating. This backup file will be named "
+                "<wallet name>-<timestamp>.legacy.bak and can be found in the directory for this wallet. In the event of "
+                "an incorrect migration, the backup can be restored with the \"Restore Wallet\" functionality."));
+    box.setStandardButtons(QMessageBox::Yes|QMessageBox::Cancel);
+    box.setDefaultButton(QMessageBox::Yes);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    showProgressDialog(
+        //: Title of progress window which is displayed when wallets are being restored.
+        tr("Restore Wallet"),
+        /*: Descriptive text of the restore wallets progress window which indicates to
+            the user that wallets are currently being restored.*/
+        tr("Restoring Wallet <b>%1</b>…").arg(GUIUtil::HtmlEscape(GUIUtil::WalletDisplayName(wallet_name))));
+
+    QTimer::singleShot(0, worker(), [this, path, wallet_name] {
+        auto res{node().walletLoader().restoreWallet(path, wallet_name, m_warning_message, /*load_after_restore=*/false)};
+
+        if (!res) {
+            m_error_message = util::ErrorString(res);
+            QTimer::singleShot(0, this, &MigrateWalletActivity::finish);
+            return;
+        }
+        QTimer::singleShot(0, this, [this, wallet_name] {
+            do_migrate(wallet_name, /*load_wallet=*/true);
+        });
+    });
+}
+
+void MigrateWalletActivity::finish()
+{
+    if (!m_error_message.empty()) {
+        QMessageBox::critical(m_parent_widget, tr("Migration failed"), QString::fromStdString(m_error_message.translated));
+    } else {
+        QMessageBox::information(m_parent_widget, tr("Migration Successful"), m_success_message);
+    }
+
+    if (m_wallet_model) Q_EMIT migrated(m_wallet_model);
+
+    Q_EMIT finished();
 }

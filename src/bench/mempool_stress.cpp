@@ -1,22 +1,35 @@
-// Copyright (c) 2011-2019 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
-#include <policy/policy.h>
+#include <consensus/amount.h>
+#include <primitives/transaction.h>
+#include <random.h>
+#include <script/script.h>
+#include <sync.h>
 #include <test/util/setup_common.h>
+#include <test/util/txmempool.h>
 #include <txmempool.h>
+#include <validation.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
-static void AddTx(const CTransactionRef& tx, CTxMemPool& pool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)
+class CCoinsViewCache;
+
+static void AddTx(const CTransactionRef& tx, CTxMemPool& pool, FastRandomContext& det_rand) EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)
 {
     int64_t nTime = 0;
     unsigned int nHeight = 1;
+    uint64_t sequence = 0;
     bool spendsCoinbase = false;
     unsigned int sigOpCost = 4;
     LockPoints lp;
-    pool.addUnchecked(CTxMemPoolEntry(tx, 1000, nTime, nHeight, spendsCoinbase, sigOpCost, lp));
+    TryAddToMempool(pool, CTxMemPoolEntry(tx, det_rand.randrange(10000)+1000, nTime, nHeight, sequence, spendsCoinbase, sigOpCost, lp));
 }
 
 struct Available {
@@ -26,16 +39,17 @@ struct Available {
     Available(CTransactionRef& ref, size_t tx_count) : ref(ref), tx_count(tx_count){}
 };
 
-static void ComplexMemPool(benchmark::State& state)
+// Create a cluster of transactions, randomly.
+static std::vector<CTransactionRef> CreateCoinCluster(FastRandomContext& det_rand, int childTxs, int min_ancestors)
 {
-    FastRandomContext det_rand{true};
     std::vector<Available> available_coins;
     std::vector<CTransactionRef> ordered_coins;
     // Create some base transactions
     size_t tx_counter = 1;
-    for (auto x = 0; x < 100; ++x) {
+    for (auto x = 0; x < 10; ++x) {
         CMutableTransaction tx = CMutableTransaction();
         tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(Txid::FromUint256(GetRandHash()), 1);
         tx.vin[0].scriptSig = CScript() << CScriptNum(tx_counter);
         tx.vin[0].scriptWitness.stack.push_back(CScriptNum(x).getvch());
         tx.vout.resize(det_rand.randrange(10)+2);
@@ -46,15 +60,17 @@ static void ComplexMemPool(benchmark::State& state)
         ordered_coins.emplace_back(MakeTransactionRef(tx));
         available_coins.emplace_back(ordered_coins.back(), tx_counter++);
     }
-    for (auto x = 0; x < 800 && !available_coins.empty(); ++x) {
+    for (auto x = 0; x < childTxs && !available_coins.empty(); ++x) {
         CMutableTransaction tx = CMutableTransaction();
         size_t n_ancestors = det_rand.randrange(10)+1;
         for (size_t ancestor = 0; ancestor < n_ancestors && !available_coins.empty(); ++ancestor){
             size_t idx = det_rand.randrange(available_coins.size());
             Available coin = available_coins[idx];
-            uint256 hash = coin.ref->GetHash();
-            // biased towards taking just one ancestor, but maybe more
-            size_t n_to_take = det_rand.randrange(2) == 0 ? 1 : 1+det_rand.randrange(coin.ref->vout.size() - coin.vin_left);
+            Txid hash = coin.ref->GetHash();
+            // biased towards taking min_ancestors parents, but maybe more
+            size_t n_to_take = det_rand.randrange(2) == 0 ?
+                               min_ancestors :
+                               min_ancestors + det_rand.randrange(coin.ref->vout.size() - coin.vin_left);
             for (size_t i = 0; i < n_to_take; ++i) {
                 tx.vin.emplace_back();
                 tx.vin.back().prevout = COutPoint(hash, coin.vin_left++);
@@ -74,16 +90,125 @@ static void ComplexMemPool(benchmark::State& state)
         ordered_coins.emplace_back(MakeTransactionRef(tx));
         available_coins.emplace_back(ordered_coins.back(), tx_counter++);
     }
-    TestingSetup test_setup;
-    CTxMemPool pool;
-    LOCK2(cs_main, pool.cs);
-    while (state.KeepRunning()) {
-        for (auto& tx : ordered_coins) {
-            AddTx(tx, pool);
-        }
-        pool.TrimToSize(pool.DynamicMemoryUsage() * 3 / 4);
-        pool.TrimToSize(GetVirtualTransactionSize(*ordered_coins.front()));
-    }
+    return ordered_coins;
 }
 
-BENCHMARK(ComplexMemPool, 1);
+static void MemPoolAddTransactions(benchmark::Bench& bench)
+{
+    FastRandomContext det_rand{true};
+    int childTxs = 50;
+    if (bench.complexityN() > 1) {
+        childTxs = static_cast<int>(bench.complexityN());
+    }
+    const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(ChainType::MAIN);
+    CTxMemPool& pool = *testing_setup.get()->m_node.mempool;
+
+    std::vector<CTransactionRef> transactions;
+    // Create 1000 clusters of 100 transactions each
+    for (int i=0; i<100; i++) {
+        auto new_txs = CreateCoinCluster(det_rand, childTxs, /*min_ancestors=*/ 1);
+        transactions.insert(transactions.end(), new_txs.begin(), new_txs.end());
+    }
+
+    LOCK2(cs_main, pool.cs);
+
+    bench.run([&]() NO_THREAD_SAFETY_ANALYSIS {
+        for (auto& tx : transactions) {
+            AddTx(tx, pool, det_rand);
+        }
+        pool.TrimToSize(0, nullptr);
+    });
+}
+
+static void ComplexMemPool(benchmark::Bench& bench)
+{
+    FastRandomContext det_rand{true};
+    int childTxs = 50;
+    if (bench.complexityN() > 1) {
+        childTxs = static_cast<int>(bench.complexityN());
+    }
+    const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(ChainType::MAIN);
+    CTxMemPool& pool = *testing_setup.get()->m_node.mempool;
+
+    std::vector<CTransactionRef> tx_remove_for_block;
+    std::vector<Txid> hashes_remove_for_block;
+
+    LOCK2(cs_main, pool.cs);
+
+    for (int i=0; i<1000; i++) {
+        std::vector<CTransactionRef> transactions = CreateCoinCluster(det_rand, childTxs, /*min_ancestors=*/1);
+
+        // Add all transactions to the mempool.
+        // Also store the first 10 transactions from each cluster as the
+        // transactions we'll "mine" in the benchmark.
+        int tx_count = 0;
+        for (auto& tx : transactions) {
+            if (tx_count < 10) {
+                tx_remove_for_block.push_back(tx);
+                ++tx_count;
+                hashes_remove_for_block.emplace_back(tx->GetHash());
+            }
+            AddTx(tx, pool, det_rand);
+        }
+    }
+
+    // Since the benchmark will be run repeatedly, we have to leave the mempool
+    // in the same state at the end of the function, so we benchmark both
+    // mining a block and reorging the block's contents back into the mempool.
+    bench.run([&]() NO_THREAD_SAFETY_ANALYSIS {
+        pool.removeForBlock(tx_remove_for_block);
+        for (auto& tx: tx_remove_for_block) {
+            AddTx(tx, pool, det_rand);
+        }
+        pool.UpdateTransactionsFromBlock(hashes_remove_for_block);
+    });
+}
+
+static void MemPoolAncestorsDescendants(benchmark::Bench& bench)
+{
+    FastRandomContext det_rand{true};
+    int childTxs = 50;
+    if (bench.complexityN() > 1) {
+        childTxs = static_cast<int>(bench.complexityN());
+    }
+    const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(ChainType::MAIN);
+    CTxMemPool& pool = *testing_setup.get()->m_node.mempool;
+
+    LOCK2(cs_main, pool.cs);
+
+    std::vector<CTransactionRef> transactions = CreateCoinCluster(det_rand, childTxs, /*min_ancestors=*/1);
+    for (auto& tx : transactions) {
+        AddTx(tx, pool, det_rand);
+    }
+
+    CTxMemPool::txiter first_tx = *pool.GetIter(transactions[0]->GetHash());
+    CTxMemPool::txiter last_tx = *pool.GetIter(transactions.back()->GetHash());
+
+    bench.run([&]() NO_THREAD_SAFETY_ANALYSIS {
+        CTxMemPool::setEntries dummy;
+        ankerl::nanobench::doNotOptimizeAway(dummy);
+        pool.CalculateDescendants({first_tx}, dummy);
+        ankerl::nanobench::doNotOptimizeAway(pool.CalculateMemPoolAncestors(*last_tx));
+    });
+}
+
+
+static void MempoolCheck(benchmark::Bench& bench)
+{
+    FastRandomContext det_rand{true};
+    auto testing_setup = MakeNoLogFileContext<TestChain100Setup>(ChainType::REGTEST, {.extra_args = {"-checkmempool=1"}});
+    CTxMemPool& pool = *testing_setup.get()->m_node.mempool;
+    LOCK2(cs_main, pool.cs);
+    testing_setup->PopulateMempool(det_rand, 400, true);
+    const CCoinsViewCache& coins_tip = testing_setup.get()->m_node.chainman->ActiveChainstate().CoinsTip();
+
+    bench.run([&]() NO_THREAD_SAFETY_ANALYSIS {
+        // Bump up the spendheight so we don't hit premature coinbase spend errors.
+        pool.check(coins_tip, /*spendheight=*/300);
+    });
+}
+
+BENCHMARK(MemPoolAncestorsDescendants);
+BENCHMARK(MemPoolAddTransactions);
+BENCHMARK(ComplexMemPool);
+BENCHMARK(MempoolCheck);

@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2019 The Bitcoin Core developers
+// Copyright (c) 2011-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -9,10 +9,12 @@
 #include <QLabel>
 
 /* Maximum allowed URI length */
-static const int MAX_URI_LENGTH = 255;
+inline constexpr int MAX_URI_LENGTH = 255;
 
 /* Size of exported QR Code image */
-static const int QR_IMAGE_SIZE = 300;
+inline constexpr int QR_IMAGE_SIZE = 300;
+inline constexpr int QR_IMAGE_TEXT_MARGIN = 10;
+inline constexpr int QR_IMAGE_MARGIN = 2 * QR_IMAGE_TEXT_MARGIN;
 
 QT_BEGIN_NAMESPACE
 class QMenu;
@@ -35,11 +37,11 @@ public Q_SLOTS:
     void copyImage();
 
 protected:
-    virtual void mousePressEvent(QMouseEvent *event);
-    virtual void contextMenuEvent(QContextMenuEvent *event);
+    virtual void mousePressEvent(QMouseEvent *event) override;
+    virtual void contextMenuEvent(QContextMenuEvent *event) override;
 
 private:
-    QMenu *contextMenu;
+    QMenu* contextMenu{nullptr};
 };
 
 #endif // BITCOIN_QT_QRIMAGEWIDGET_H

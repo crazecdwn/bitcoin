@@ -1,15 +1,20 @@
-// Copyright (c) 2015-2019 The Bitcoin Core developers
+// Copyright (c) 2015-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_HTTPRPC_H
 #define BITCOIN_HTTPRPC_H
 
+#include <any>
+
+class JSONRPCRequest;
+class UniValue;
+enum HTTPStatusCode : int;
 
 /** Start HTTP RPC subsystem.
  * Precondition; HTTP and RPC has been started.
  */
-bool StartHTTPRPC();
+bool StartHTTPRPC(const std::any& context);
 /** Interrupt HTTP RPC subsystem.
  */
 void InterruptHTTPRPC();
@@ -18,10 +23,15 @@ void InterruptHTTPRPC();
  */
 void StopHTTPRPC();
 
+/** Execute a single HTTP request containing one or more JSONRPC requests.
+ * Specified `jreq` will be modified and `status` will be returned.
+ */
+UniValue ExecuteHTTPRPC(const UniValue& valRequest, JSONRPCRequest& jreq, HTTPStatusCode& status);
+
 /** Start HTTP REST subsystem.
  * Precondition; HTTP and RPC has been started.
  */
-void StartREST();
+void StartREST(const std::any& context);
 /** Interrupt RPC REST subsystem.
  */
 void InterruptREST();
@@ -30,4 +40,4 @@ void InterruptREST();
  */
 void StopREST();
 
-#endif
+#endif // BITCOIN_HTTPRPC_H

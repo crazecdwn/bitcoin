@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2019-2020 The Bitcoin Core developers
+# Copyright (c) 2019-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 export LC_ALL=C.UTF-8
 
-export CONTAINER_NAME=ci_native_valgrind
-export PACKAGES="valgrind clang llvm python3-zmq libevent-dev bsdmainutils libboost-system-dev libboost-filesystem-dev libboost-test-dev libboost-thread-dev libdb5.3++-dev libminiupnpc-dev libzmq3-dev"
+export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:26.04"
+export PACKAGES="clang llvm libclang-rt-dev valgrind python3-zmq libboost-dev libzmq3-dev libsqlite3-dev libcapnp-dev capnproto python3-pip"
+export PIP_PACKAGES="--break-system-packages pycapnp"
 export USE_VALGRIND=1
 export NO_DEPENDS=1
-if [[ "${TRAVIS}" == "true" && "${TRAVIS_REPO_SLUG}" != "bitcoin/bitcoin" ]]; then
-  export TEST_RUNNER_EXTRA="wallet_disable"  # Only run wallet_disable as a smoke test to not hit the 50 min travis time limit
-else
-  export TEST_RUNNER_EXTRA="--exclude rpc_bind --factor=2"  # Excluded for now, see https://github.com/bitcoin/bitcoin/issues/17765#issuecomment-602068547
-fi
-export GOAL="install"
-export BITCOIN_CONFIG="--enable-zmq --with-incompatible-bdb --with-gui=no CC=clang CXX=clang++"  # TODO enable GUI
+printf -v BITCOIN_CONFIG "%q " \
+ --preset=dev-mode \
+ -DBUILD_GUI=OFF  `# GUI disabled, because it only passes with a DEBUG=1 depends build` \
+ -DWITH_USDT=OFF \
+ -DCMAKE_C_COMPILER=clang \
+ -DCMAKE_CXX_COMPILER=clang++
+export BITCOIN_CONFIG
